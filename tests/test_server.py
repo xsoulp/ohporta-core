@@ -32,8 +32,10 @@ class UserStoreAndPolicyTests(unittest.TestCase):
         raw = self.database.read_text()
         self.assertNotIn("bearer1", raw)
         self.assertNotIn("bearer2", raw)
-        self.assertEqual("admin", self.store.authenticate("bearer1")["role"])
-        self.assertEqual("user", self.store.authenticate("bearer2")["role"])
+        admin = self.store.authenticate("bearer1")
+        user = self.store.authenticate("bearer2")
+        self.assertEqual(("Luis", "admin"), (admin["name"], admin["role"]))
+        self.assertEqual(("Mafalda", "user", True), (user["name"], user["role"], user["allow_remote"]))
         self.assertIsNone(self.store.authenticate("invalid"))
 
     def test_admin_bypasses_schedule_distance_and_remote_restrictions(self):
@@ -42,7 +44,7 @@ class UserStoreAndPolicyTests(unittest.TestCase):
         self.assertEqual((True, None), server_module.access_decision(admin, True, self.monday_10))
 
     def test_user_schedule_day_enabled_distance_and_remote_rules(self):
-        base = dict(self.user, schedules=[{"allowed_days": ["monday"], "start_time": "09:00", "end_time": "17:00"}])
+        base = dict(self.user, allow_remote=False, schedules=[{"allowed_days": ["monday"], "start_time": "09:00", "end_time": "17:00"}])
         self.assertEqual((True, None), server_module.access_decision(base, False, self.monday_10))
         self.assertEqual((False, "outside_allowed_schedule"), server_module.access_decision(base, False, self.monday_10.replace(hour=18)))
         self.assertEqual((False, "outside_allowed_schedule"), server_module.access_decision(base, False, self.monday_10.replace(day=8)))
@@ -124,7 +126,7 @@ class HTTPTests(unittest.TestCase):
     def test_capabilities_identifies_user_and_never_returns_token(self):
         status, payload = self.request("GET", "/access/capabilities?lat=38.7109387&lon=-9.1702945", "bearer2")
         self.assertEqual(200, status)
-        self.assertEqual({"id": 2, "name": "User 2", "role": "user"}, payload["user"])
+        self.assertEqual({"id": 2, "name": "Mafalda", "role": "user"}, payload["user"])
         self.assertNotIn("token", json.dumps(payload))
         self.assertTrue(payload["doors"]["APT"]["can_open"])
 

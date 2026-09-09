@@ -176,8 +176,8 @@ class UserStore:
             data = {
                 "next_id": 3,
                 "users": [
-                    {"id": 1, "name": "Admin", "token_hash": token_hash(admin_token), "role": "admin", "enabled": True, "allow_remote": True, "schedules": [{"allowed_days": list(WEEKDAYS), "start_time": "00:00", "end_time": "23:59"}]},
-                    {"id": 2, "name": "User 2", "token_hash": token_hash(restricted_token), "role": "user", "enabled": True, "allow_remote": False, "schedules": [{"allowed_days": list(WEEKDAYS), "start_time": "00:00", "end_time": "23:59"}]},
+                    {"id": 1, "name": "Luis", "token_hash": token_hash(admin_token), "role": "admin", "enabled": True, "allow_remote": True, "schedules": [{"allowed_days": list(WEEKDAYS), "start_time": "00:00", "end_time": "23:59"}]},
+                    {"id": 2, "name": "Mafalda", "token_hash": token_hash(restricted_token), "role": "user", "enabled": True, "allow_remote": True, "schedules": [{"allowed_days": list(WEEKDAYS), "start_time": "00:00", "end_time": "23:59"}]},
                 ],
             }
             self._save(data)

@@ -25,8 +25,9 @@ Os utilizadores sao guardados por omissao em `users.json` (modo `0600`). O
 ficheiro contem apenas hashes SHA-256 dos tokens. Na primeira execucao, os
 argumentos existentes `--token-file` e `--restricted-token-file` criam:
 
-- id 1, `Admin`, role `admin`, com o bearer principal existente;
-- id 2, `User 2`, role `user`, com o bearer restrito existente.
+- id 1, `Luis`, role `admin`, com o bearer principal existente;
+- id 2, `Mafalda`, role `user`, com o bearer restrito existente, acesso remoto
+  e horario permanente.
 
 Depois da primeira execucao, o servidor autentica exclusivamente através de
 `users.json`; os argumentos dos tokens legados tornam-se opcionais.
