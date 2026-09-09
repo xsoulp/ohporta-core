@@ -45,7 +45,7 @@ Resposta `200 OK`:
 ### `GET /access/capabilities?lat=<LATITUDE>&lon=<LONGITUDE>`
 
 Identifica o utilizador pelo bearer e calcula se pode operar cada porta,
-considerando estado, role, horario, dia, distancia maxima e acesso remoto.
+considerando estado, role, horario, dia, distancia e acesso remoto.
 
 Payload: sem body. As coordenadas sao enviadas na query string.
 
@@ -71,14 +71,14 @@ Resposta `200 OK`:
       "can_open": <true|false>,
       "mode": "<local|remote>",
       "requires_warning": <true|false>,
-      "reason": <null|"user_disabled"|"outside_allowed_schedule"|"distance_not_allowed"|"remote_access_not_allowed">
+      "reason": <null|"user_disabled"|"outside_allowed_schedule"|"remote_access_not_allowed">
     },
     "BLD": {
       "distance_m": <DISTANCIA_METROS>,
       "can_open": <true|false>,
       "mode": "<local|remote>",
       "requires_warning": <true|false>,
-      "reason": <null|"user_disabled"|"outside_allowed_schedule"|"distance_not_allowed"|"remote_access_not_allowed">
+      "reason": <null|"user_disabled"|"outside_allowed_schedule"|"remote_access_not_allowed">
     }
   }
 }
@@ -192,7 +192,6 @@ Representacao normal de um utilizador:
   "role": "<admin|user>",
   "enabled": <true|false>,
   "allow_remote": <true|false>,
-  "max_distance_m": <NUMERO_OU_NULL>,
   "schedules": [
     {
       "allowed_days": ["<DIA_1>", "<DIA_2>"],
@@ -203,9 +202,9 @@ Representacao normal de um utilizador:
 }
 ```
 
-`max_distance_m: null` significa que nao existe limite maximo de distancia.
-Isso nao ignora `allow_remote`: se `allow_remote` for `false`, a operacao
-continua bloqueada quando a distancia for considerada remota.
+`allow_remote: false` permite apenas operacoes locais, a menos de 100 metros.
+`allow_remote: true` permite operacoes a qualquer distancia. O limite local de
+100 metros e fixo no backend.
 
 Cada item de `schedules` e um periodo independente. O utilizador pode operar
 quando pelo menos um periodo corresponde ao dia e hora atuais. Uma lista vazia
@@ -230,7 +229,6 @@ Resposta `200 OK`:
       "role": "<admin|user>",
       "enabled": <true|false>,
       "allow_remote": <true|false>,
-      "max_distance_m": <NUMERO_OU_NULL>,
       "schedules": [
         {
           "allowed_days": ["<DIA_1>", "<DIA_2>"],
@@ -255,7 +253,6 @@ Payload:
   "name": "<NOME>",
   "enabled": <true|false>,
   "allow_remote": <true|false>,
-  "max_distance_m": <NUMERO_OU_NULL>,
   "schedules": [
     {
       "allowed_days": ["monday", "tuesday", "wednesday"],
@@ -280,7 +277,6 @@ Resposta `201 Created`:
   "role": "user",
   "enabled": <true|false>,
   "allow_remote": <true|false>,
-  "max_distance_m": <NUMERO_OU_NULL>,
   "schedules": [
     {
       "allowed_days": ["<DIA_1>", "<DIA_2>"],
@@ -327,7 +323,6 @@ Payload de exemplo:
   "name": "<NOVO_NOME>",
   "enabled": <true|false>,
   "allow_remote": <true|false>,
-  "max_distance_m": <NUMERO_OU_NULL>,
   "schedules": [
     {
       "allowed_days": ["monday", "friday"],
@@ -383,8 +378,8 @@ Operacao recusada pelas permissoes:
 }
 ```
 
-`<RAZAO>` pode ser `user_disabled`, `outside_allowed_schedule`,
-`distance_not_allowed` ou `remote_access_not_allowed`.
+`<RAZAO>` pode ser `user_disabled`, `outside_allowed_schedule` ou
+`remote_access_not_allowed`.
 
 Coordenadas obrigatorias ausentes ou invalidas numa operacao de utilizador:
 

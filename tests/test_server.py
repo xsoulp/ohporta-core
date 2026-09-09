@@ -38,25 +38,23 @@ class UserStoreAndPolicyTests(unittest.TestCase):
 
     def test_admin_bypasses_schedule_distance_and_remote_restrictions(self):
         admin = self.store.authenticate("bearer1")
-        admin.update(schedules=[], allow_remote=False, max_distance_m=1)
-        self.assertEqual((True, None), server_module.access_decision(admin, 100_000, True, self.monday_10))
+        admin.update(schedules=[], allow_remote=False)
+        self.assertEqual((True, None), server_module.access_decision(admin, True, self.monday_10))
 
     def test_user_schedule_day_enabled_distance_and_remote_rules(self):
-        base = dict(self.user, schedules=[{"allowed_days": ["monday"], "start_time": "09:00", "end_time": "17:00"}], max_distance_m=None)
-        self.assertEqual((True, None), server_module.access_decision(base, 25, False, self.monday_10))
-        self.assertEqual((False, "outside_allowed_schedule"), server_module.access_decision(base, 25, False, self.monday_10.replace(hour=18)))
-        self.assertEqual((False, "outside_allowed_schedule"), server_module.access_decision(base, 25, False, self.monday_10.replace(day=8)))
-        self.assertEqual((False, "user_disabled"), server_module.access_decision(dict(base, enabled=False), 25, False, self.monday_10))
-        limited = dict(base, max_distance_m=50)
-        self.assertEqual((True, None), server_module.access_decision(limited, 50, False, self.monday_10))
-        self.assertEqual((False, "distance_not_allowed"), server_module.access_decision(limited, 50.1, False, self.monday_10))
-        self.assertEqual((False, "remote_access_not_allowed"), server_module.access_decision(base, 150, True, self.monday_10))
-        self.assertEqual((True, None), server_module.access_decision(dict(base, allow_remote=True), 150, True, self.monday_10))
+        base = dict(self.user, schedules=[{"allowed_days": ["monday"], "start_time": "09:00", "end_time": "17:00"}])
+        self.assertEqual((True, None), server_module.access_decision(base, False, self.monday_10))
+        self.assertEqual((False, "outside_allowed_schedule"), server_module.access_decision(base, False, self.monday_10.replace(hour=18)))
+        self.assertEqual((False, "outside_allowed_schedule"), server_module.access_decision(base, False, self.monday_10.replace(day=8)))
+        self.assertEqual((False, "user_disabled"), server_module.access_decision(dict(base, enabled=False), False, self.monday_10))
+        self.assertEqual(100.0, server_module.LOCAL_DISTANCE_LIMIT_M)
+        self.assertEqual((False, "remote_access_not_allowed"), server_module.access_decision(base, True, self.monday_10))
+        self.assertEqual((True, None), server_module.access_decision(dict(base, allow_remote=True), True, self.monday_10))
 
     def test_overnight_schedule_uses_previous_allowed_day(self):
         user = dict(self.user, schedules=[{"allowed_days": ["monday"], "start_time": "22:00", "end_time": "06:00"}])
         tuesday_02 = datetime(2026, 9, 8, 2, 0, tzinfo=server_module.LISBON)
-        self.assertEqual((True, None), server_module.access_decision(user, 1, False, tuesday_02))
+        self.assertEqual((True, None), server_module.access_decision(user, False, tuesday_02))
 
     def test_multiple_periods_allow_any_matching_period(self):
         user = dict(self.user, schedules=[
@@ -64,9 +62,9 @@ class UserStoreAndPolicyTests(unittest.TestCase):
             {"allowed_days": ["monday"], "start_time": "14:00", "end_time": "20:00"},
             {"allowed_days": ["saturday", "sunday"], "start_time": "10:00", "end_time": "14:00"},
         ])
-        self.assertEqual((True, None), server_module.access_decision(user, 1, False, self.monday_10))
-        self.assertEqual((False, "outside_allowed_schedule"), server_module.access_decision(user, 1, False, self.monday_10.replace(hour=13)))
-        self.assertEqual((True, None), server_module.access_decision(user, 1, False, self.monday_10.replace(hour=15)))
+        self.assertEqual((True, None), server_module.access_decision(user, False, self.monday_10))
+        self.assertEqual((False, "outside_allowed_schedule"), server_module.access_decision(user, False, self.monday_10.replace(hour=13)))
+        self.assertEqual((True, None), server_module.access_decision(user, False, self.monday_10.replace(hour=15)))
 
     def test_legacy_single_schedule_payload_is_normalised(self):
         created = self.store.create_user({"name": "Legacy", "allowed_days": ["monday"], "start_time": "08:00", "end_time": "12:00"})
@@ -141,8 +139,16 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(403, status)
         self.assertEqual("admin_required", payload["error"])
 
+    def test_distance_limit_field_is_not_accepted_or_returned(self):
+        status, payload = self.request("POST", "/admin/users", "bearer1", {"name": "No limit", "max_distance_m": 500})
+        self.assertEqual(400, status)
+        self.assertIn("max_distance_m", payload["error"])
+        status, listed = self.request("GET", "/admin/users", "bearer1")
+        self.assertEqual(200, status)
+        self.assertNotIn("max_distance_m", json.dumps(listed))
+
     def test_admin_crud_returns_token_only_on_create(self):
-        new_values = {"name": "Maria", "enabled": True, "allow_remote": True, "max_distance_m": 750, "schedules": [
+        new_values = {"name": "Maria", "enabled": True, "allow_remote": True, "schedules": [
             {"allowed_days": ["monday", "friday"], "start_time": "08:30", "end_time": "12:00"},
             {"allowed_days": ["monday", "friday"], "start_time": "14:00", "end_time": "19:00"},
         ]}

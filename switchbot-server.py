@@ -22,7 +22,7 @@ BASE_DIR = Path(__file__).resolve().parent
 LISBON = ZoneInfo("Europe/Lisbon")
 WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
 LEGACY_SCHEDULE_FIELDS = {"allowed_days", "start_time", "end_time"}
-USER_FIELDS = {"name", "enabled", "allow_remote", "max_distance_m", "schedules"} | LEGACY_SCHEDULE_FIELDS
+USER_FIELDS = {"name", "enabled", "allow_remote", "schedules"} | LEGACY_SCHEDULE_FIELDS
 TIME_PATTERN = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
 
 # Door locations can diverge later without changing handlers.
@@ -107,13 +107,6 @@ def _validate_user_fields(data, *, require_name=False):
             if not isinstance(data[field], bool):
                 raise ValueError(f"{field} must be a boolean")
             cleaned[field] = data[field]
-    if "max_distance_m" in data:
-        distance = data["max_distance_m"]
-        if distance is not None:
-            if isinstance(distance, bool) or not isinstance(distance, (int, float)) or not math.isfinite(distance) or distance < 0:
-                raise ValueError("max_distance_m must be a non-negative number or null")
-            distance = float(distance)
-        cleaned["max_distance_m"] = distance
     if "schedules" in data:
         schedules = data["schedules"]
         if not isinstance(schedules, list) or len(schedules) > 32:
@@ -183,8 +176,8 @@ class UserStore:
             data = {
                 "next_id": 3,
                 "users": [
-                    {"id": 1, "name": "Admin", "token_hash": token_hash(admin_token), "role": "admin", "enabled": True, "allow_remote": True, "max_distance_m": None, "schedules": [{"allowed_days": list(WEEKDAYS), "start_time": "00:00", "end_time": "23:59"}]},
-                    {"id": 2, "name": "User 2", "token_hash": token_hash(restricted_token), "role": "user", "enabled": True, "allow_remote": False, "max_distance_m": None, "schedules": [{"allowed_days": list(WEEKDAYS), "start_time": "00:00", "end_time": "23:59"}]},
+                    {"id": 1, "name": "Admin", "token_hash": token_hash(admin_token), "role": "admin", "enabled": True, "allow_remote": True, "schedules": [{"allowed_days": list(WEEKDAYS), "start_time": "00:00", "end_time": "23:59"}]},
+                    {"id": 2, "name": "User 2", "token_hash": token_hash(restricted_token), "role": "user", "enabled": True, "allow_remote": False, "schedules": [{"allowed_days": list(WEEKDAYS), "start_time": "00:00", "end_time": "23:59"}]},
                 ],
             }
             self._save(data)
@@ -224,7 +217,7 @@ class UserStore:
             user = {
                 "id": data["next_id"], "name": cleaned["name"], "token_hash": token_hash(token), "role": "user",
                 "enabled": cleaned.get("enabled", True), "allow_remote": cleaned.get("allow_remote", False),
-                "max_distance_m": cleaned.get("max_distance_m"), "schedules": schedules,
+                "schedules": schedules,
             }
             data["next_id"] += 1
             data["users"].append(user)
@@ -282,16 +275,13 @@ def schedule_allows(user, now):
     return any(_schedule_period_allows(schedule, now) for schedule in user["schedules"])
 
 
-def access_decision(user, distance_m, is_remote, now=None):
+def access_decision(user, is_remote, now=None):
     if not user["enabled"]:
         return False, "user_disabled"
     if user["role"] == "admin":
         return True, None
     if not schedule_allows(user, now or current_lisbon_time()):
         return False, "outside_allowed_schedule"
-    maximum = user["max_distance_m"]
-    if maximum is not None and distance_m > maximum:
-        return False, "distance_not_allowed"
     if is_remote and not user["allow_remote"]:
         return False, "remote_access_not_allowed"
     return True, None
@@ -387,7 +377,7 @@ class Handler(BaseHTTPRequestHandler):
             distance = self._door_distance((latitude, longitude), door_name)
             distances.append(distance)
             is_remote = distance >= LOCAL_DISTANCE_LIMIT_M
-            allowed, reason = access_decision(user, distance, is_remote, now)
+            allowed, reason = access_decision(user, is_remote, now)
             doors[door_name] = {"distance_m": round(distance, 1), "can_open": allowed, "mode": "remote" if is_remote else "local", "requires_warning": is_remote and allowed, "reason": reason}
         nearest_distance = min(distances)
         return {
@@ -511,7 +501,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             door_name = "APT" if path.startswith("/apt_door/") else "BLD"
             distance = self._door_distance(coordinates, door_name)
-            allowed, reason = access_decision(user, distance, distance >= LOCAL_DISTANCE_LIMIT_M)
+            allowed, reason = access_decision(user, distance >= LOCAL_DISTANCE_LIMIT_M)
             if not allowed:
                 self._reply(403, {"ok": False, "error": reason, "reason": reason, "distance_m": round(distance, 1)})
                 return
