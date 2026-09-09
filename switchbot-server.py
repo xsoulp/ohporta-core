@@ -2,27 +2,33 @@
 """Small HTTP API for the local SwitchBot command scripts."""
 
 import argparse
+import hashlib
 import hmac
 import json
 import math
 import os
+import re
+import secrets
 import subprocess
+import threading
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
+from zoneinfo import ZoneInfo
 
 
 BASE_DIR = Path(__file__).resolve().parent
+LISBON = ZoneInfo("Europe/Lisbon")
+WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+USER_FIELDS = {"name", "enabled", "allow_remote", "max_distance_m", "allowed_days", "start_time", "end_time"}
+TIME_PATTERN = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
 
-# Access configuration. Door locations can diverge later without changing handlers.
+# Door locations can diverge later without changing handlers.
 LOCAL_DISTANCE_LIMIT_M = 100.0
 DOORS = {
     "APT": {"latitude": 0.42863112, "longitude": -140.21179414},
     "BLD": {"latitude": 0.42863112, "longitude": -140.21179414},
-}
-ACCESS_POLICIES = {
-    "full": {"remote_access": True},
-    "restricted": {"remote_access": False},
 }
 COMMANDS = {
     "/apt_door/status": ("GET", (str(BASE_DIR / "switchbot-lock.py"), "status")),
@@ -38,31 +44,214 @@ def haversine_distance(latitude, longitude, target_latitude, target_longitude):
     lat2 = math.radians(target_latitude)
     delta_lat = lat2 - lat1
     delta_lon = math.radians(target_longitude - longitude)
-    a = (
-        math.sin(delta_lat / 2.0) ** 2
-        + math.cos(lat1) * math.cos(lat2) * math.sin(delta_lon / 2.0) ** 2
-    )
+    a = math.sin(delta_lat / 2.0) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(delta_lon / 2.0) ** 2
     a = min(1.0, max(0.0, a))
     return 6_371_000.0 * 2.0 * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
 
 
 def valid_coordinates(latitude, longitude):
-    return (
-        math.isfinite(latitude)
-        and math.isfinite(longitude)
-        and -90.0 <= latitude <= 90.0
-        and -180.0 <= longitude <= 180.0
-    )
+    return math.isfinite(latitude) and math.isfinite(longitude) and -90.0 <= latitude <= 90.0 and -180.0 <= longitude <= 180.0
+
+
+def current_lisbon_time():
+    return datetime.now(LISBON)
+
+
+def token_hash(token):
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def public_user(user):
+    return {key: value for key, value in user.items() if key != "token_hash"}
+
+
+def _validate_user_fields(data, *, require_name=False):
+    if not isinstance(data, dict):
+        raise ValueError("JSON body must be an object")
+    unknown = set(data) - USER_FIELDS
+    if unknown:
+        raise ValueError(f"unknown fields: {', '.join(sorted(unknown))}")
+    if require_name and "name" not in data:
+        raise ValueError("name is required")
+    cleaned = {}
+    if "name" in data:
+        name = data["name"]
+        if not isinstance(name, str) or not name.strip() or len(name.strip()) > 100:
+            raise ValueError("name must contain 1 to 100 characters")
+        cleaned["name"] = name.strip()
+    for field in ("enabled", "allow_remote"):
+        if field in data:
+            if not isinstance(data[field], bool):
+                raise ValueError(f"{field} must be a boolean")
+            cleaned[field] = data[field]
+    if "max_distance_m" in data:
+        distance = data["max_distance_m"]
+        if distance is not None:
+            if isinstance(distance, bool) or not isinstance(distance, (int, float)) or not math.isfinite(distance) or distance < 0:
+                raise ValueError("max_distance_m must be a non-negative number or null")
+            distance = float(distance)
+        cleaned["max_distance_m"] = distance
+    if "allowed_days" in data:
+        days = data["allowed_days"]
+        if not isinstance(days, list) or any(day not in WEEKDAYS for day in days):
+            raise ValueError(f"allowed_days must contain only: {', '.join(WEEKDAYS)}")
+        if len(days) != len(set(days)):
+            raise ValueError("allowed_days must not contain duplicates")
+        cleaned["allowed_days"] = [day for day in WEEKDAYS if day in days]
+    for field in ("start_time", "end_time"):
+        if field in data:
+            value = data[field]
+            if not isinstance(value, str) or not TIME_PATTERN.fullmatch(value):
+                raise ValueError(f"{field} must use HH:MM (24-hour) format")
+            cleaned[field] = value
+    return cleaned
+
+
+class UserStore:
+    """Small atomic JSON store. Only token hashes are persisted."""
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self._lock = threading.RLock()
+
+    def exists(self):
+        return self.path.exists()
+
+    def _load(self):
+        if not self.path.exists():
+            return {"next_id": 1, "users": []}
+        data = json.loads(self.path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or not isinstance(data.get("users"), list):
+            raise ValueError("invalid users database")
+        return data
+
+    def _save(self, data):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_name(f"{self.path.name}.tmp")
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump(data, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, self.path)
+
+    def bootstrap_legacy_tokens(self, admin_token, restricted_token):
+        """Create initial users while preserving both existing bearer values."""
+        with self._lock:
+            if self.path.exists():
+                return False
+            if not admin_token or not restricted_token:
+                raise ValueError("both legacy tokens are required for first-time migration")
+            if hmac.compare_digest(admin_token, restricted_token):
+                raise ValueError("legacy tokens must be different")
+            data = {
+                "next_id": 3,
+                "users": [
+                    {"id": 1, "name": "Admin", "token_hash": token_hash(admin_token), "role": "admin", "enabled": True, "allow_remote": True, "max_distance_m": None, "allowed_days": list(WEEKDAYS), "start_time": "00:00", "end_time": "23:59"},
+                    {"id": 2, "name": "User 2", "token_hash": token_hash(restricted_token), "role": "user", "enabled": True, "allow_remote": False, "max_distance_m": None, "allowed_days": list(WEEKDAYS), "start_time": "00:00", "end_time": "23:59"},
+                ],
+            }
+            self._save(data)
+            return True
+
+    def authenticate(self, token):
+        supplied_hash = token_hash(token)
+        with self._lock:
+            for user in self._load()["users"]:
+                if hmac.compare_digest(supplied_hash, user["token_hash"]):
+                    return dict(user)
+        return None
+
+    def list_users(self):
+        with self._lock:
+            return [public_user(user) for user in self._load()["users"]]
+
+    def get_user(self, user_id):
+        with self._lock:
+            for user in self._load()["users"]:
+                if user["id"] == user_id:
+                    return public_user(user)
+        return None
+
+    def create_user(self, values):
+        cleaned = _validate_user_fields(values, require_name=True)
+        token = secrets.token_urlsafe(32)
+        with self._lock:
+            data = self._load()
+            user = {
+                "id": data["next_id"], "name": cleaned["name"], "token_hash": token_hash(token), "role": "user",
+                "enabled": cleaned.get("enabled", True), "allow_remote": cleaned.get("allow_remote", False),
+                "max_distance_m": cleaned.get("max_distance_m"), "allowed_days": cleaned.get("allowed_days", list(WEEKDAYS)),
+                "start_time": cleaned.get("start_time", "00:00"), "end_time": cleaned.get("end_time", "23:59"),
+            }
+            data["next_id"] += 1
+            data["users"].append(user)
+            self._save(data)
+        result = public_user(user)
+        result["token"] = token
+        return result
+
+    def update_user(self, user_id, values):
+        cleaned = _validate_user_fields(values)
+        if not cleaned:
+            raise ValueError("at least one editable field is required")
+        with self._lock:
+            data = self._load()
+            for user in data["users"]:
+                if user["id"] == user_id:
+                    user.update(cleaned)
+                    self._save(data)
+                    return public_user(user)
+        return None
+
+    def delete_user(self, user_id):
+        with self._lock:
+            data = self._load()
+            for index, user in enumerate(data["users"]):
+                if user["id"] == user_id:
+                    deleted = data["users"].pop(index)
+                    self._save(data)
+                    return public_user(deleted)
+        return None
+
+
+def schedule_allows(user, now):
+    current_time = now.strftime("%H:%M")
+    start, end = user["start_time"], user["end_time"]
+    today = WEEKDAYS[now.weekday()]
+    if start <= end:
+        return today in user["allowed_days"] and start <= current_time <= end
+    if current_time >= start:
+        return today in user["allowed_days"]
+    if current_time <= end:
+        previous_day = WEEKDAYS[(now - timedelta(days=1)).weekday()]
+        return previous_day in user["allowed_days"]
+    return False
+
+
+def access_decision(user, distance_m, is_remote, now=None):
+    if not user["enabled"]:
+        return False, "user_disabled"
+    if user["role"] == "admin":
+        return True, None
+    if not schedule_allows(user, now or current_lisbon_time()):
+        return False, "outside_allowed_schedule"
+    maximum = user["max_distance_m"]
+    if maximum is not None and distance_m > maximum:
+        return False, "distance_not_allowed"
+    if is_remote and not user["allow_remote"]:
+        return False, "remote_access_not_allowed"
+    return True, None
 
 
 class SwitchBotHTTPServer(HTTPServer):
-    token: str
-    restricted_token: str
     command_timeout: float
+    user_store: UserStore
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "SwitchBotHTTP/1"
+    server_version = "SwitchBotHTTP/2"
 
     def _reply(self, status, payload):
         data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
@@ -76,77 +265,82 @@ class Handler(BaseHTTPRequestHandler):
         except BrokenPipeError:
             pass
 
-    def _access_level(self):
-        supplied = self.headers.get("Authorization", "")
-        if hmac.compare_digest(supplied, f"Bearer {self.server.token}"):
-            return "full"
-        if hmac.compare_digest(supplied, f"Bearer {self.server.restricted_token}"):
-            return "restricted"
-        return None
+    def _empty_reply(self, status):
+        self.send_response(status)
+        self.send_header("Content-Length", "0")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
 
-    def _restricted_distance(self, door_name):
+    def _json_body(self):
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError as exc:
+            raise ValueError("invalid Content-Length") from exc
+        if length <= 0 or length > 65_536:
+            raise ValueError("JSON body is required and must not exceed 65536 bytes")
+        try:
+            return json.loads(self.rfile.read(length))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("invalid JSON body") from exc
+
+    def _authenticated_user(self):
+        supplied = self.headers.get("Authorization", "")
+        scheme, separator, token = supplied.partition(" ")
+        if separator != " " or scheme != "Bearer" or not token or " " in token:
+            return None
+        return self.server.user_store.authenticate(token)
+
+    def _require_user(self):
+        user = self._authenticated_user()
+        if user is None:
+            self._unauthorized()
+        return user
+
+    def _require_admin(self):
+        user = self._require_user()
+        if user is None:
+            return None
+        if not user["enabled"] or user["role"] != "admin":
+            self._reply(403, {"ok": False, "error": "admin_required"})
+            return None
+        return user
+
+    def _header_coordinates(self):
         try:
             latitude = float(self.headers["X-Latitude"])
             longitude = float(self.headers["X-Longitude"])
         except (KeyError, TypeError, ValueError):
             return None
-
-        if not valid_coordinates(latitude, longitude):
-            return None
-
-        door = DOORS[door_name]
-        return haversine_distance(
-            latitude,
-            longitude,
-            door["latitude"],
-            door["longitude"],
-        )
+        return (latitude, longitude) if valid_coordinates(latitude, longitude) else None
 
     def _query_coordinates(self):
         query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
-        latitude_values = query.get("lat", [])
-        longitude_values = query.get("lon", [])
+        latitude_values, longitude_values = query.get("lat", []), query.get("lon", [])
         if len(latitude_values) != 1 or len(longitude_values) != 1:
             return None
         try:
-            latitude = float(latitude_values[0])
-            longitude = float(longitude_values[0])
+            latitude, longitude = float(latitude_values[0]), float(longitude_values[0])
         except (TypeError, ValueError):
             return None
-        if not valid_coordinates(latitude, longitude):
-            return None
-        return latitude, longitude
+        return (latitude, longitude) if valid_coordinates(latitude, longitude) else None
 
-    def _capabilities(self, access_level, latitude, longitude):
-        remote_access = ACCESS_POLICIES[access_level]["remote_access"]
-        doors = {}
-        distances = []
-        for door_name, door in DOORS.items():
-            distance = haversine_distance(
-                latitude,
-                longitude,
-                door["latitude"],
-                door["longitude"],
-            )
+    def _door_distance(self, coordinates, door_name):
+        door = DOORS[door_name]
+        return haversine_distance(coordinates[0], coordinates[1], door["latitude"], door["longitude"])
+
+    def _capabilities(self, user, latitude, longitude):
+        doors, distances = {}, []
+        now = current_lisbon_time()
+        for door_name in DOORS:
+            distance = self._door_distance((latitude, longitude), door_name)
             distances.append(distance)
             is_remote = distance >= LOCAL_DISTANCE_LIMIT_M
-            allowed = not is_remote or remote_access
-            doors[door_name] = {
-                "distance_m": round(distance, 1),
-                "can_open": allowed,
-                "mode": "remote" if is_remote else "local",
-                "requires_warning": is_remote and allowed,
-                "reason": None if allowed else "remote_access_not_permitted",
-            }
-
+            allowed, reason = access_decision(user, distance, is_remote, now)
+            doors[door_name] = {"distance_m": round(distance, 1), "can_open": allowed, "mode": "remote" if is_remote else "local", "requires_warning": is_remote and allowed, "reason": reason}
         nearest_distance = min(distances)
         return {
-            "location": {
-                "lat": latitude,
-                "lon": longitude,
-                "distance_m": round(nearest_distance, 1),
-                "remote": nearest_distance >= LOCAL_DISTANCE_LIMIT_M,
-            },
+            "user": {key: user[key] for key in ("id", "name", "role")},
+            "location": {"lat": latitude, "lon": longitude, "distance_m": round(nearest_distance, 1), "remote": nearest_distance >= LOCAL_DISTANCE_LIMIT_M},
             "local_distance_limit_m": LOCAL_DISTANCE_LIMIT_M,
             "doors": doors,
         }
@@ -157,114 +351,124 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
-    def _method_not_allowed(self, allowed_method):
+    def _method_not_allowed(self, allowed_methods):
         self.send_response(405)
-        self.send_header("Allow", allowed_method)
+        self.send_header("Allow", ", ".join(allowed_methods))
         self.send_header("Content-Length", "0")
         self.end_headers()
 
-    def _handle(self):
-        path = self.path.split("?", 1)[0].rstrip("/") or "/"
-
-        if path == "/health" and self.command == "GET":
-            self._reply(200, {"ok": True})
+    def _handle_admin(self, path):
+        if self._require_admin() is None:
             return
-
-        if path == "/access/capabilities":
-            if self.command != "GET":
-                self._method_not_allowed("GET")
-                return
-            access_level = self._access_level()
-            if access_level is None:
-                self._unauthorized()
-                return
-            coordinates = self._query_coordinates()
-            if coordinates is None:
-                self._reply(400, {"ok": False, "error": "invalid coordinates"})
-                return
-            self._reply(200, self._capabilities(access_level, *coordinates))
+        if path == "/admin/users":
+            if self.command == "GET":
+                self._reply(200, {"users": self.server.user_store.list_users()})
+            elif self.command == "POST":
+                try:
+                    self._reply(201, self.server.user_store.create_user(self._json_body()))
+                except ValueError as exc:
+                    self._reply(400, {"ok": False, "error": str(exc)})
+            else:
+                self._method_not_allowed(("GET", "POST"))
             return
-
-        spec = COMMANDS.get(path)
-        if spec is None:
+        match = re.fullmatch(r"/admin/users/(\d+)", path)
+        if match is None:
             self._reply(404, {"ok": False, "error": "endpoint not found"})
             return
-
-        method, argv = spec
-        if self.command != method:
-            self._method_not_allowed(method)
-            return
-
-        access_level = self._access_level()
-        if access_level is None:
-            self._unauthorized()
-            return
-
-        if access_level == "restricted":
-            door_name = "APT" if path.startswith("/apt_door/") else "BLD"
-            distance = self._restricted_distance(door_name)
-            if distance is None:
-                self._reply(
-                    400,
-                    {"ok": False, "error": "coordenadas GPS obrigatórias ou inválidas"},
-                )
+        user_id = int(match.group(1))
+        if self.command == "GET":
+            user = self.server.user_store.get_user(user_id)
+            self._reply(200, user) if user is not None else self._reply(404, {"ok": False, "error": "user_not_found"})
+        elif self.command == "PUT":
+            try:
+                user = self.server.user_store.update_user(user_id, self._json_body())
+            except ValueError as exc:
+                self._reply(400, {"ok": False, "error": str(exc)})
                 return
-            if distance >= LOCAL_DISTANCE_LIMIT_M:
-                self._reply(
-                    403,
-                    {
-                        "ok": False,
-                        "error": "muito longe de casa",
-                        "distance_m": round(distance, 1),
-                    },
-                )
-                return
+            self._reply(200, user) if user is not None else self._reply(404, {"ok": False, "error": "user_not_found"})
+        elif self.command == "DELETE":
+            if self.server.user_store.delete_user(user_id) is None:
+                self._reply(404, {"ok": False, "error": "user_not_found"})
+            else:
+                self._empty_reply(204)
+        else:
+            self._method_not_allowed(("GET", "PUT", "DELETE"))
 
+    def _execute_command(self, path, argv):
         try:
-            result = subprocess.run(
-                argv,
-                cwd=BASE_DIR,
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                text=True,
-                timeout=self.server.command_timeout,
-                check=False,
-            )
+            result = subprocess.run(argv, cwd=BASE_DIR, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=self.server.command_timeout, check=False)
         except subprocess.TimeoutExpired:
             self._reply(504, {"ok": False, "error": "command timed out"})
             return
         except OSError as exc:
             self._reply(500, {"ok": False, "error": str(exc)})
             return
-
-        output = result.stdout.strip()
-        error = result.stderr.strip()
+        output, error = result.stdout.strip(), result.stderr.strip()
         if result.returncode == 0:
             self._reply(200, {"ok": True, "output": output})
+            return
+        details = error or output
+        device = "apt_door" if path.startswith("/apt_door/") else "bld_door"
+        config_error = any(marker in details for marker in (".switchbot-lock.env", ".switchbot-bot.env", "PermissionError", "FileNotFoundError"))
+        if config_error:
+            self._reply(503, {"ok": False, "error": f"{device} configuration unavailable"})
+        elif "Traceback (most recent call last)" in details:
+            self._reply(502, {"ok": False, "error": f"{device} command failed"})
         else:
-            details = error or output
-            device = "apt_door" if path.startswith("/apt_door/") else "bld_door"
-            config_error = any(
-                marker in details
-                for marker in (
-                    ".switchbot-lock.env",
-                    ".switchbot-bot.env",
-                    "PermissionError",
-                    "FileNotFoundError",
-                )
-            )
-            if config_error:
-                self._reply(
-                    503,
-                    {"ok": False, "error": f"{device} configuration unavailable"},
-                )
-            elif "Traceback (most recent call last)" in details:
-                self._reply(502, {"ok": False, "error": f"{device} command failed"})
-            else:
-                self._reply(502, {"ok": False, "error": details or "command failed"})
+            self._reply(502, {"ok": False, "error": details or "command failed"})
+
+    def _handle(self):
+        path = self.path.split("?", 1)[0].rstrip("/") or "/"
+        if path == "/health" and self.command == "GET":
+            self._reply(200, {"ok": True})
+            return
+        if path == "/access/capabilities":
+            if self.command != "GET":
+                self._method_not_allowed(("GET",))
+                return
+            user = self._require_user()
+            if user is None:
+                return
+            coordinates = self._query_coordinates()
+            if coordinates is None:
+                self._reply(400, {"ok": False, "error": "invalid coordinates"})
+                return
+            self._reply(200, self._capabilities(user, *coordinates))
+            return
+        if path == "/admin/users" or path.startswith("/admin/users/"):
+            self._handle_admin(path)
+            return
+        spec = COMMANDS.get(path)
+        if spec is None:
+            self._reply(404, {"ok": False, "error": "endpoint not found"})
+            return
+        method, argv = spec
+        if self.command != method:
+            self._method_not_allowed((method,))
+            return
+        user = self._require_user()
+        if user is None:
+            return
+        if not user["enabled"]:
+            self._reply(403, {"ok": False, "error": "user_disabled", "reason": "user_disabled"})
+            return
+        if user["role"] != "admin":
+            coordinates = self._header_coordinates()
+            if coordinates is None:
+                self._reply(400, {"ok": False, "error": "coordenadas GPS obrigatórias ou inválidas"})
+                return
+            door_name = "APT" if path.startswith("/apt_door/") else "BLD"
+            distance = self._door_distance(coordinates, door_name)
+            allowed, reason = access_decision(user, distance, distance >= LOCAL_DISTANCE_LIMIT_M)
+            if not allowed:
+                self._reply(403, {"ok": False, "error": reason, "reason": reason, "distance_m": round(distance, 1)})
+                return
+        self._execute_command(path, argv)
 
     do_GET = _handle
     do_POST = _handle
+    do_PUT = _handle
+    do_DELETE = _handle
 
     def log_message(self, fmt, *args):
         print(f"{self.address_string()} - {fmt % args}", flush=True)
@@ -275,25 +479,27 @@ def parse_args():
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--timeout", type=float, default=45.0)
-    parser.add_argument("--token-file", type=Path, required=True)
-    parser.add_argument("--restricted-token-file", type=Path, required=True)
+    parser.add_argument("--users-file", type=Path, default=BASE_DIR / "users.json")
+    parser.add_argument("--token-file", type=Path)
+    parser.add_argument("--restricted-token-file", type=Path)
     return parser.parse_args()
+
+
+def _read_optional_token(path):
+    return path.expanduser().read_text().strip() if path else None
 
 
 def main():
     args = parse_args()
-    token = args.token_file.expanduser().read_text().strip()
-    restricted_token = args.restricted_token_file.expanduser().read_text().strip()
-    if not token:
-        raise SystemExit("token file is empty")
-    if not restricted_token:
-        raise SystemExit("restricted token file is empty")
-    if hmac.compare_digest(token, restricted_token):
-        raise SystemExit("tokens must be different")
-
+    user_store = UserStore(args.users_file.expanduser())
+    if not user_store.exists():
+        try:
+            user_store.bootstrap_legacy_tokens(_read_optional_token(args.token_file), _read_optional_token(args.restricted_token_file))
+        except (OSError, ValueError) as exc:
+            raise SystemExit(f"could not migrate legacy tokens: {exc}") from exc
+        print(f"Migrated legacy tokens to {user_store.path}", flush=True)
     server = SwitchBotHTTPServer((args.host, args.port), Handler)
-    server.token = token
-    server.restricted_token = restricted_token
+    server.user_store = user_store
     server.command_timeout = args.timeout
     print(f"Listening on {args.host}:{args.port}", flush=True)
     try:
