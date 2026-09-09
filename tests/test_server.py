@@ -38,11 +38,11 @@ class UserStoreAndPolicyTests(unittest.TestCase):
 
     def test_admin_bypasses_schedule_distance_and_remote_restrictions(self):
         admin = self.store.authenticate("bearer1")
-        admin.update(allowed_days=[], start_time="11:00", end_time="11:01", allow_remote=False, max_distance_m=1)
+        admin.update(schedules=[], allow_remote=False, max_distance_m=1)
         self.assertEqual((True, None), server_module.access_decision(admin, 100_000, True, self.monday_10))
 
     def test_user_schedule_day_enabled_distance_and_remote_rules(self):
-        base = dict(self.user, allowed_days=["monday"], start_time="09:00", end_time="17:00", max_distance_m=None)
+        base = dict(self.user, schedules=[{"allowed_days": ["monday"], "start_time": "09:00", "end_time": "17:00"}], max_distance_m=None)
         self.assertEqual((True, None), server_module.access_decision(base, 25, False, self.monday_10))
         self.assertEqual((False, "outside_allowed_schedule"), server_module.access_decision(base, 25, False, self.monday_10.replace(hour=18)))
         self.assertEqual((False, "outside_allowed_schedule"), server_module.access_decision(base, 25, False, self.monday_10.replace(day=8)))
@@ -54,9 +54,25 @@ class UserStoreAndPolicyTests(unittest.TestCase):
         self.assertEqual((True, None), server_module.access_decision(dict(base, allow_remote=True), 150, True, self.monday_10))
 
     def test_overnight_schedule_uses_previous_allowed_day(self):
-        user = dict(self.user, allowed_days=["monday"], start_time="22:00", end_time="06:00")
+        user = dict(self.user, schedules=[{"allowed_days": ["monday"], "start_time": "22:00", "end_time": "06:00"}])
         tuesday_02 = datetime(2026, 9, 8, 2, 0, tzinfo=server_module.LISBON)
         self.assertEqual((True, None), server_module.access_decision(user, 1, False, tuesday_02))
+
+    def test_multiple_periods_allow_any_matching_period(self):
+        user = dict(self.user, schedules=[
+            {"allowed_days": ["monday"], "start_time": "08:00", "end_time": "12:00"},
+            {"allowed_days": ["monday"], "start_time": "14:00", "end_time": "20:00"},
+            {"allowed_days": ["saturday", "sunday"], "start_time": "10:00", "end_time": "14:00"},
+        ])
+        self.assertEqual((True, None), server_module.access_decision(user, 1, False, self.monday_10))
+        self.assertEqual((False, "outside_allowed_schedule"), server_module.access_decision(user, 1, False, self.monday_10.replace(hour=13)))
+        self.assertEqual((True, None), server_module.access_decision(user, 1, False, self.monday_10.replace(hour=15)))
+
+    def test_legacy_single_schedule_payload_is_normalised(self):
+        created = self.store.create_user({"name": "Legacy", "allowed_days": ["monday"], "start_time": "08:00", "end_time": "12:00"})
+        fetched = self.store.get_user(created["id"])
+        self.assertEqual([{"allowed_days": ["monday"], "start_time": "08:00", "end_time": "12:00"}], fetched["schedules"])
+        self.assertNotIn("allowed_days", fetched)
 
 
 class HTTPTests(unittest.TestCase):
@@ -126,7 +142,10 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual("admin_required", payload["error"])
 
     def test_admin_crud_returns_token_only_on_create(self):
-        new_values = {"name": "Maria", "enabled": True, "allow_remote": True, "max_distance_m": 750, "allowed_days": ["monday", "friday"], "start_time": "08:30", "end_time": "19:00"}
+        new_values = {"name": "Maria", "enabled": True, "allow_remote": True, "max_distance_m": 750, "schedules": [
+            {"allowed_days": ["monday", "friday"], "start_time": "08:30", "end_time": "12:00"},
+            {"allowed_days": ["monday", "friday"], "start_time": "14:00", "end_time": "19:00"},
+        ]}
         status, created = self.request("POST", "/admin/users", "bearer1", new_values)
         self.assertEqual(201, status)
         self.assertIn("token", created)
@@ -135,11 +154,13 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertNotIn("token", fetched)
         self.assertNotIn("token_hash", fetched)
+        self.assertEqual(2, len(fetched["schedules"]))
         status, updated = self.request("PUT", f"/admin/users/{user_id}", "bearer1", {"enabled": False, "name": "Maria S."})
         self.assertEqual(200, status)
         self.assertFalse(updated["enabled"])
         status, listed = self.request("GET", "/admin/users", "bearer1")
         self.assertEqual(200, status)
+        self.assertEqual({1, 2, user_id}, {user["id"] for user in listed["users"]})
         self.assertNotIn("token", json.dumps(listed))
         status, _ = self.request("DELETE", f"/admin/users/{user_id}", "bearer1")
         self.assertEqual(204, status)

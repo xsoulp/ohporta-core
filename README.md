@@ -31,9 +31,12 @@ argumentos existentes `--token-file` e `--restricted-token-file` criam:
 Depois da primeira execucao, o servidor autentica exclusivamente através de
 `users.json`; os argumentos dos tokens legados tornam-se opcionais.
 
-Os dias usam nomes ingleses em minusculas (`monday` a `sunday`) e as horas usam
-`HH:MM`. Os horarios sao avaliados em `Europe/Lisbon` e podem atravessar a
-meia-noite.
+Cada utilizador tem uma lista `schedules`, que permite varios periodos com dias
+e horas independentes. Os dias usam nomes ingleses em minusculas (`monday` a
+`sunday`) e as horas usam `HH:MM`. Os horarios sao avaliados em
+`Europe/Lisbon` e podem atravessar a meia-noite. Os campos antigos
+`allowed_days`, `start_time` e `end_time` continuam aceites na escrita e sao
+convertidos num unico periodo.
 
 ## Executar
 

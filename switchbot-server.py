@@ -21,7 +21,8 @@ from zoneinfo import ZoneInfo
 BASE_DIR = Path(__file__).resolve().parent
 LISBON = ZoneInfo("Europe/Lisbon")
 WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
-USER_FIELDS = {"name", "enabled", "allow_remote", "max_distance_m", "allowed_days", "start_time", "end_time"}
+LEGACY_SCHEDULE_FIELDS = {"allowed_days", "start_time", "end_time"}
+USER_FIELDS = {"name", "enabled", "allow_remote", "max_distance_m", "schedules"} | LEGACY_SCHEDULE_FIELDS
 TIME_PATTERN = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
 
 # Door locations can diverge later without changing handlers.
@@ -65,6 +66,26 @@ def public_user(user):
     return {key: value for key, value in user.items() if key != "token_hash"}
 
 
+def _validate_schedule(schedule):
+    if not isinstance(schedule, dict):
+        raise ValueError("each schedule must be an object")
+    required = LEGACY_SCHEDULE_FIELDS
+    if set(schedule) != required:
+        raise ValueError("each schedule requires only allowed_days, start_time and end_time")
+    days = schedule["allowed_days"]
+    if not isinstance(days, list) or any(day not in WEEKDAYS for day in days):
+        raise ValueError(f"allowed_days must contain only: {', '.join(WEEKDAYS)}")
+    if len(days) != len(set(days)):
+        raise ValueError("allowed_days must not contain duplicates")
+    result = {"allowed_days": [day for day in WEEKDAYS if day in days]}
+    for field in ("start_time", "end_time"):
+        value = schedule[field]
+        if not isinstance(value, str) or not TIME_PATTERN.fullmatch(value):
+            raise ValueError(f"{field} must use HH:MM (24-hour) format")
+        result[field] = value
+    return result
+
+
 def _validate_user_fields(data, *, require_name=False):
     if not isinstance(data, dict):
         raise ValueError("JSON body must be an object")
@@ -73,6 +94,8 @@ def _validate_user_fields(data, *, require_name=False):
         raise ValueError(f"unknown fields: {', '.join(sorted(unknown))}")
     if require_name and "name" not in data:
         raise ValueError("name is required")
+    if "schedules" in data and LEGACY_SCHEDULE_FIELDS.intersection(data):
+        raise ValueError("schedules cannot be combined with legacy schedule fields")
     cleaned = {}
     if "name" in data:
         name = data["name"]
@@ -91,20 +114,30 @@ def _validate_user_fields(data, *, require_name=False):
                 raise ValueError("max_distance_m must be a non-negative number or null")
             distance = float(distance)
         cleaned["max_distance_m"] = distance
-    if "allowed_days" in data:
-        days = data["allowed_days"]
-        if not isinstance(days, list) or any(day not in WEEKDAYS for day in days):
-            raise ValueError(f"allowed_days must contain only: {', '.join(WEEKDAYS)}")
-        if len(days) != len(set(days)):
-            raise ValueError("allowed_days must not contain duplicates")
-        cleaned["allowed_days"] = [day for day in WEEKDAYS if day in days]
-    for field in ("start_time", "end_time"):
-        if field in data:
-            value = data[field]
-            if not isinstance(value, str) or not TIME_PATTERN.fullmatch(value):
-                raise ValueError(f"{field} must use HH:MM (24-hour) format")
-            cleaned[field] = value
+    if "schedules" in data:
+        schedules = data["schedules"]
+        if not isinstance(schedules, list) or len(schedules) > 32:
+            raise ValueError("schedules must be a list with at most 32 periods")
+        cleaned["schedules"] = [_validate_schedule(schedule) for schedule in schedules]
+    legacy = {field: data[field] for field in LEGACY_SCHEDULE_FIELDS if field in data}
+    if legacy:
+        defaults = {"allowed_days": list(WEEKDAYS), "start_time": "00:00", "end_time": "23:59"}
+        defaults.update(legacy)
+        validated = _validate_schedule(defaults)
+        for field in LEGACY_SCHEDULE_FIELDS:
+            if field in legacy:
+                cleaned[field] = validated[field]
     return cleaned
+
+
+def _normalise_user_schedule(user):
+    if "schedules" not in user:
+        user["schedules"] = [{
+            "allowed_days": user.pop("allowed_days", list(WEEKDAYS)),
+            "start_time": user.pop("start_time", "00:00"),
+            "end_time": user.pop("end_time", "23:59"),
+        }]
+    return user
 
 
 class UserStore:
@@ -123,6 +156,8 @@ class UserStore:
         data = json.loads(self.path.read_text(encoding="utf-8"))
         if not isinstance(data, dict) or not isinstance(data.get("users"), list):
             raise ValueError("invalid users database")
+        for user in data["users"]:
+            _normalise_user_schedule(user)
         return data
 
     def _save(self, data):
@@ -148,8 +183,8 @@ class UserStore:
             data = {
                 "next_id": 3,
                 "users": [
-                    {"id": 1, "name": "Admin", "token_hash": token_hash(admin_token), "role": "admin", "enabled": True, "allow_remote": True, "max_distance_m": None, "allowed_days": list(WEEKDAYS), "start_time": "00:00", "end_time": "23:59"},
-                    {"id": 2, "name": "User 2", "token_hash": token_hash(restricted_token), "role": "user", "enabled": True, "allow_remote": False, "max_distance_m": None, "allowed_days": list(WEEKDAYS), "start_time": "00:00", "end_time": "23:59"},
+                    {"id": 1, "name": "Admin", "token_hash": token_hash(admin_token), "role": "admin", "enabled": True, "allow_remote": True, "max_distance_m": None, "schedules": [{"allowed_days": list(WEEKDAYS), "start_time": "00:00", "end_time": "23:59"}]},
+                    {"id": 2, "name": "User 2", "token_hash": token_hash(restricted_token), "role": "user", "enabled": True, "allow_remote": False, "max_distance_m": None, "schedules": [{"allowed_days": list(WEEKDAYS), "start_time": "00:00", "end_time": "23:59"}]},
                 ],
             }
             self._save(data)
@@ -176,14 +211,20 @@ class UserStore:
 
     def create_user(self, values):
         cleaned = _validate_user_fields(values, require_name=True)
+        schedules = cleaned.pop("schedules", None)
+        if schedules is None:
+            schedules = [{
+                "allowed_days": cleaned.pop("allowed_days", list(WEEKDAYS)),
+                "start_time": cleaned.pop("start_time", "00:00"),
+                "end_time": cleaned.pop("end_time", "23:59"),
+            }]
         token = secrets.token_urlsafe(32)
         with self._lock:
             data = self._load()
             user = {
                 "id": data["next_id"], "name": cleaned["name"], "token_hash": token_hash(token), "role": "user",
                 "enabled": cleaned.get("enabled", True), "allow_remote": cleaned.get("allow_remote", False),
-                "max_distance_m": cleaned.get("max_distance_m"), "allowed_days": cleaned.get("allowed_days", list(WEEKDAYS)),
-                "start_time": cleaned.get("start_time", "00:00"), "end_time": cleaned.get("end_time", "23:59"),
+                "max_distance_m": cleaned.get("max_distance_m"), "schedules": schedules,
             }
             data["next_id"] += 1
             data["users"].append(user)
@@ -200,6 +241,13 @@ class UserStore:
             data = self._load()
             for user in data["users"]:
                 if user["id"] == user_id:
+                    legacy = {field: cleaned.pop(field) for field in tuple(LEGACY_SCHEDULE_FIELDS) if field in cleaned}
+                    if legacy:
+                        if len(user["schedules"]) != 1:
+                            raise ValueError("use schedules when the user has multiple periods")
+                        schedule = dict(user["schedules"][0])
+                        schedule.update(legacy)
+                        cleaned["schedules"] = [_validate_schedule(schedule)]
                     user.update(cleaned)
                     self._save(data)
                     return public_user(user)
@@ -216,18 +264,22 @@ class UserStore:
         return None
 
 
-def schedule_allows(user, now):
+def _schedule_period_allows(schedule, now):
     current_time = now.strftime("%H:%M")
-    start, end = user["start_time"], user["end_time"]
+    start, end = schedule["start_time"], schedule["end_time"]
     today = WEEKDAYS[now.weekday()]
     if start <= end:
-        return today in user["allowed_days"] and start <= current_time <= end
+        return today in schedule["allowed_days"] and start <= current_time <= end
     if current_time >= start:
-        return today in user["allowed_days"]
+        return today in schedule["allowed_days"]
     if current_time <= end:
         previous_day = WEEKDAYS[(now - timedelta(days=1)).weekday()]
-        return previous_day in user["allowed_days"]
+        return previous_day in schedule["allowed_days"]
     return False
+
+
+def schedule_allows(user, now):
+    return any(_schedule_period_allows(schedule, now) for schedule in user["schedules"])
 
 
 def access_decision(user, distance_m, is_remote, now=None):

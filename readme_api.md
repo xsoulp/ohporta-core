@@ -180,6 +180,8 @@ Resposta `200 OK`:
 Todos os endpoints desta seccao exigem o bearer de um utilizador `admin`
 ativo. As respostas nunca incluem o token nem o seu hash, exceto o token
 completo devolvido uma unica vez pelo `POST /admin/users`.
+O admin autentica-se apenas com o seu proprio bearer; nao precisa dos tokens
+dos restantes utilizadores.
 
 Representacao normal de um utilizador:
 
@@ -191,15 +193,25 @@ Representacao normal de um utilizador:
   "enabled": <true|false>,
   "allow_remote": <true|false>,
   "max_distance_m": <NUMERO_OU_NULL>,
-  "allowed_days": ["<DIA_1>", "<DIA_2>"],
-  "start_time": "<HH:MM>",
-  "end_time": "<HH:MM>"
+  "schedules": [
+    {
+      "allowed_days": ["<DIA_1>", "<DIA_2>"],
+      "start_time": "<HH:MM>",
+      "end_time": "<HH:MM>"
+    }
+  ]
 }
 ```
 
 `max_distance_m: null` significa que nao existe limite maximo de distancia.
 Isso nao ignora `allow_remote`: se `allow_remote` for `false`, a operacao
 continua bloqueada quando a distancia for considerada remota.
+
+Cada item de `schedules` e um periodo independente. O utilizador pode operar
+quando pelo menos um periodo corresponde ao dia e hora atuais. Uma lista vazia
+nao permite operar em nenhum horario. Para compatibilidade, os campos antigos
+`allowed_days`, `start_time` e `end_time` ainda podem ser enviados sem
+`schedules`; o servidor converte-os num unico periodo.
 
 ### `GET /admin/users`
 
@@ -219,9 +231,13 @@ Resposta `200 OK`:
       "enabled": <true|false>,
       "allow_remote": <true|false>,
       "max_distance_m": <NUMERO_OU_NULL>,
-      "allowed_days": ["<DIA_1>", "<DIA_2>"],
-      "start_time": "<HH:MM>",
-      "end_time": "<HH:MM>"
+      "schedules": [
+        {
+          "allowed_days": ["<DIA_1>", "<DIA_2>"],
+          "start_time": "<HH:MM>",
+          "end_time": "<HH:MM>"
+        }
+      ]
     }
   ]
 }
@@ -240,9 +256,18 @@ Payload:
   "enabled": <true|false>,
   "allow_remote": <true|false>,
   "max_distance_m": <NUMERO_OU_NULL>,
-  "allowed_days": ["monday", "tuesday", "wednesday"],
-  "start_time": "<HH:MM>",
-  "end_time": "<HH:MM>"
+  "schedules": [
+    {
+      "allowed_days": ["monday", "tuesday", "wednesday"],
+      "start_time": "08:00",
+      "end_time": "12:00"
+    },
+    {
+      "allowed_days": ["monday", "tuesday", "wednesday"],
+      "start_time": "14:00",
+      "end_time": "20:00"
+    }
+  ]
 }
 ```
 
@@ -256,9 +281,13 @@ Resposta `201 Created`:
   "enabled": <true|false>,
   "allow_remote": <true|false>,
   "max_distance_m": <NUMERO_OU_NULL>,
-  "allowed_days": ["<DIA_1>", "<DIA_2>"],
-  "start_time": "<HH:MM>",
-  "end_time": "<HH:MM>",
+  "schedules": [
+    {
+      "allowed_days": ["<DIA_1>", "<DIA_2>"],
+      "start_time": "<HH:MM>",
+      "end_time": "<HH:MM>"
+    }
+  ],
   "token": "<TOKEN_COMPLETO_GUARDAR_AGORA>"
 }
 ```
@@ -299,9 +328,18 @@ Payload de exemplo:
   "enabled": <true|false>,
   "allow_remote": <true|false>,
   "max_distance_m": <NUMERO_OU_NULL>,
-  "allowed_days": ["monday", "friday"],
-  "start_time": "<HH:MM>",
-  "end_time": "<HH:MM>"
+  "schedules": [
+    {
+      "allowed_days": ["monday", "friday"],
+      "start_time": "08:00",
+      "end_time": "12:00"
+    },
+    {
+      "allowed_days": ["saturday", "sunday"],
+      "start_time": "10:00",
+      "end_time": "14:00"
+    }
+  ]
 }
 ```
 
