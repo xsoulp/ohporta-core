@@ -47,7 +47,7 @@ async def main():
             break
 
         print(
-            f"SwitchBot Bot não encontrado (tentativa {attempt}/{scan_attempts})",
+            f"SwitchBot Bot not found (attempt {attempt}/{scan_attempts})",
             file=sys.stderr,
         )
 
@@ -56,7 +56,7 @@ async def main():
 
     if ble_device is None:
         raise SystemExit(
-            f"SwitchBot Bot não encontrado por Bluetooth após {scan_attempts} tentativas"
+            f"SwitchBot Bot not found via Bluetooth after {scan_attempts} attempts"
         )
 
     device = Switchbot(
@@ -72,11 +72,11 @@ async def main():
         # connection open for the press below.
         info = await device.get_basic_info()
         if info is None:
-            raise SystemExit("SwitchBot Bot não respondeu à leitura de estado")
+            raise SystemExit("SwitchBot Bot did not respond to the status request")
 
         result = await device.press()
         if result is not True:
-            raise SystemExit(f"SwitchBot Bot não confirmou o comando: {result!r}")
+            raise SystemExit(f"SwitchBot Bot did not acknowledge the command: {result!r}")
 
         print("pressed")
     finally:

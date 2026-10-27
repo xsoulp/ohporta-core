@@ -409,13 +409,12 @@ Operation denied by permissions:
 `<REASON>` can be `user_disabled`, `outside_allowed_schedule`, or
 `remote_access_not_allowed`.
 
-Missing or invalid required coordinates for a user operation (the API returns
-this message in Portuguese, meaning "GPS coordinates required or invalid"):
+Missing or invalid required coordinates for a user operation:
 
 ```json
 {
   "ok": false,
-  "error": "coordenadas GPS obrigatorias ou invalidas"
+  "error": "GPS coordinates are required and must be valid"
 }
 ```
 

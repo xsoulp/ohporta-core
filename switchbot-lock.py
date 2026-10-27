@@ -28,7 +28,7 @@ async def get_status(mac):
     locks = await GetSwitchbotDevices().get_locks()
 
     if mac not in locks:
-        raise SystemExit("Lock Pro não encontrado por Bluetooth")
+        raise SystemExit("Lock Pro not found via Bluetooth")
 
     print(locks[mac].data["data"])
 
@@ -40,7 +40,7 @@ async def execute_action(mac, action):
     )
 
     if ble_device is None:
-        raise SystemExit("Lock Pro não encontrado por Bluetooth")
+        raise SystemExit("Lock Pro not found via Bluetooth")
 
     device = lock.SwitchbotLock(
         ble_device,
@@ -67,7 +67,7 @@ async def main():
 
     if len(sys.argv) != 2 or sys.argv[1] not in valid_actions:
         raise SystemExit(
-            f"Uso: {sys.argv[0]} status|lock|unlock|open"
+            f"Usage: {sys.argv[0]} status|lock|unlock|open"
         )
 
     action = sys.argv[1]

@@ -622,7 +622,7 @@ class Handler(BaseHTTPRequestHandler):
         if user["role"] != "admin":
             coordinates = self._header_coordinates()
             if coordinates is None:
-                self._reply(400, {"ok": False, "error": "coordenadas GPS obrigatórias ou inválidas"})
+                self._reply(400, {"ok": False, "error": "GPS coordinates are required and must be valid"})
                 return
             door_name = "APT" if path.startswith("/apt_door/") else "BLD"
             distance = self._door_distance(coordinates, door_name)
