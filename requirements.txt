@@ -1,2 +1,6 @@
 bleak==3.0.2
-PySwitchbot==2.7.0
+# PySwitchbot 2.7.0 is vendored in switchbot/; these are its runtime dependencies.
+aiohttp>=3.9.5
+bleak-retry-connector>=3.4.0
+cryptography>=39.0.0
+pyOpenSSL>=23.0.0

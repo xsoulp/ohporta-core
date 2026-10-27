@@ -197,22 +197,29 @@ class UserStore:
         os.chmod(temporary, 0o600)
         os.replace(temporary, self.path)
 
-    def bootstrap_legacy_tokens(self, admin_token, restricted_token):
-        """Create initial users while preserving both existing bearer values."""
+    def bootstrap_users(self, admin_token, restricted_token=None):
+        """Create the admin, optionally importing a legacy regular-user token."""
         with self._lock:
             if self.path.exists():
                 return False
-            if not admin_token or not restricted_token:
-                raise ValueError("both legacy tokens are required for first-time migration")
-            if hmac.compare_digest(admin_token, restricted_token):
-                raise ValueError("legacy tokens must be different")
+            if not admin_token:
+                raise ValueError("an admin token is required for first-time setup; use --token-file")
+            if restricted_token is not None:
+                if not restricted_token:
+                    raise ValueError("the optional restricted token must not be empty")
+                if hmac.compare_digest(admin_token, restricted_token):
+                    raise ValueError("admin and restricted tokens must be different")
             data = {
-                "next_id": 3,
+                "next_id": 2,
                 "users": [
                     {"id": 1, "name": "Administrator", "token_hash": token_hash(admin_token), "role": "admin", "enabled": True, "allow_remote": True, "schedules": [{"allowed_days": list(WEEKDAYS), "start_time": "00:00", "end_time": "23:59"}]},
-                    {"id": 2, "name": "Restricted user", "token_hash": token_hash(restricted_token), "role": "user", "enabled": True, "allow_remote": True, "schedules": [{"allowed_days": list(WEEKDAYS), "start_time": "00:00", "end_time": "23:59"}]},
                 ],
             }
+            if restricted_token is not None:
+                data["users"].append(
+                    {"id": 2, "name": "Restricted user", "token_hash": token_hash(restricted_token), "role": "user", "enabled": True, "allow_remote": True, "schedules": [{"allowed_days": list(WEEKDAYS), "start_time": "00:00", "end_time": "23:59"}]}
+                )
+                data["next_id"] = 3
             self._save(data)
             return True
 
@@ -641,8 +648,8 @@ def parse_args():
     parser.add_argument("--timeout", type=float, default=45.0)
     parser.add_argument("--users-file", type=Path, default=BASE_DIR / "users.json")
     parser.add_argument("--history-file", type=Path, default=BASE_DIR / "access-history.json")
-    parser.add_argument("--token-file", type=Path)
-    parser.add_argument("--restricted-token-file", type=Path)
+    parser.add_argument("--token-file", type=Path, help="admin token file, required for first-time setup")
+    parser.add_argument("--restricted-token-file", type=Path, help="optional legacy regular-user token file for migration")
     return parser.parse_args()
 
 
@@ -655,10 +662,20 @@ def main():
     user_store = UserStore(args.users_file.expanduser())
     if not user_store.exists():
         try:
-            user_store.bootstrap_legacy_tokens(_read_optional_token(args.token_file), _read_optional_token(args.restricted_token_file))
+            user_store.bootstrap_users(_read_optional_token(args.token_file), _read_optional_token(args.restricted_token_file))
         except (OSError, ValueError) as exc:
-            raise SystemExit(f"could not migrate legacy tokens: {exc}") from exc
-        print(f"Migrated legacy tokens to {user_store.path}", flush=True)
+            raise SystemExit(f"could not initialize users: {exc}") from exc
+        print(f"Initialized users in {user_store.path}", flush=True)
+    else:
+        for option, path in (
+            ("--token-file", args.token_file),
+            ("--restricted-token-file", args.restricted_token_file),
+        ):
+            if path is not None:
+                print(
+                    f"Ignored {option} file {path}: users database {user_store.path} already exists.",
+                    flush=True,
+                )
     server = SwitchBotHTTPServer((args.host, args.port), Handler)
     server.user_store = user_store
     server.history_store = AccessHistoryStore(args.history_file.expanduser())

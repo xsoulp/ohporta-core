@@ -5,9 +5,9 @@ After=bluetooth.service
 
 [Service]
 Type=simple
-Environment=PATH=%h/switchbot-venv/bin:/usr/local/bin:/usr/bin:/bin
-ExecStart=%h/switchbot-venv/bin/python %h/domotica_server/switchbot-server.py --host 0.0.0.0 --port 8765
-WorkingDirectory=%h/domotica_server
+Environment=PATH=%h/ohporta-core/.venv/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/ohporta-core/.venv/bin/python %h/ohporta-core/ohporta-server.py --host 0.0.0.0 --port 8765
+WorkingDirectory=%h/ohporta-core
 Restart=on-failure
 RestartSec=2
 NoNewPrivileges=true

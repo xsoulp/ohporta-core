@@ -1,0 +1,160 @@
+"""Switchbot Device Consts Library."""
+
+from __future__ import annotations
+
+from ..enum import StrEnum
+from .air_purifier import AirPurifierMode, AirQualityLevel
+from .climate import ClimateAction, ClimateMode, SmartThermostatRadiatorMode
+from .evaporative_humidifier import (
+    HumidifierAction,
+    HumidifierMode,
+    HumidifierWaterLevel,
+)
+from .fan import (
+    CirculatorFanProMode,
+    FanMode,
+    HorizontalOscillationAngle,
+    NightLightState,
+    StandingFanMode,
+    VerticalOscillationAngle,
+)
+from .light import (
+    BulbColorMode,
+    CeilingLightColorMode,
+    ColorMode,
+    StripLightColorMode,
+)
+
+# Preserve old LockStatus export for backwards compatibility
+from .lock import LockStatus
+
+DEFAULT_RETRY_COUNT = 3
+DEFAULT_RETRY_TIMEOUT = 1
+DEFAULT_SCAN_TIMEOUT = 5
+
+
+class SwitchbotApiError(RuntimeError):
+    """
+    Raised when API call fails.
+
+    This exception inherits from RuntimeError to avoid breaking existing code
+    but will be changed to Exception in a future release.
+    """
+
+
+class SwitchbotAuthenticationError(RuntimeError):
+    """
+    Raised when authentication fails.
+
+    This exception inherits from RuntimeError to avoid breaking existing code
+    but will be changed to Exception in a future release.
+    """
+
+
+class SwitchbotAccountConnectionError(RuntimeError):
+    """
+    Raised when connection to Switchbot account fails.
+
+    This exception inherits from RuntimeError to avoid breaking existing code
+    but will be changed to Exception in a future release.
+    """
+
+
+class SwitchbotModel(StrEnum):
+    BOT = "WoHand"
+    CURTAIN = "WoCurtain"
+    HUMIDIFIER = "WoHumi"
+    PLUG_MINI = "WoPlug"
+    CONTACT_SENSOR = "WoContact"
+    LIGHT_STRIP = "WoStrip"
+    METER = "WoSensorTH"
+    METER_PRO = "WoTHP"
+    METER_PRO_C = "WoTHPc"
+    IO_METER = "WoIOSensorTH"
+    MOTION_SENSOR = "WoPresence"
+    COLOR_BULB = "WoBulb"
+    CEILING_LIGHT = "WoCeiling"
+    LOCK = "WoLock"
+    LOCK_PRO = "WoLockPro"
+    BLIND_TILT = "WoBlindTilt"
+    HUB2 = "WoHub2"
+    LEAK = "Leak Detector"
+    KEYPAD = "WoKeypad"
+    RELAY_SWITCH_1PM = "Relay Switch 1PM"
+    RELAY_SWITCH_1 = "Relay Switch 1"
+    REMOTE = "WoRemote"
+    UNIVERSAL_REMOTE = "WoUniversalRemote"
+    EVAPORATIVE_HUMIDIFIER = "Evaporative Humidifier"
+    ROLLER_SHADE = "Roller Shade"
+    HUBMINI_MATTER = "HubMini Matter"
+    CIRCULATOR_FAN = "Circulator Fan"
+    CIRCULATOR_FAN_PRO = "Circulator Fan Pro"
+    STANDING_FAN = "Standing Fan"
+    K20_VACUUM = "K20 Vacuum"
+    S10_VACUUM = "S10 Vacuum"
+    K10_VACUUM = "K10+ Vacuum"
+    K10_PRO_VACUUM = "K10+ Pro Vacuum"
+    K10_PRO_COMBO_VACUUM = "K10+ Pro Combo Vacuum"
+    AIR_PURIFIER_US = "Air Purifier US"
+    AIR_PURIFIER_JP = "Air Purifier JP"
+    AIR_PURIFIER_TABLE_US = "Air Purifier Table US"
+    AIR_PURIFIER_TABLE_JP = "Air Purifier Table JP"
+    HUB3 = "Hub3"
+    LOCK_ULTRA = "Lock Ultra"
+    LOCK_LITE = "Lock Lite"
+    GARAGE_DOOR_OPENER = "Garage Door Opener"
+    RELAY_SWITCH_2PM = "Relay Switch 2PM"
+    STRIP_LIGHT_3 = "Strip Light 3"
+    FLOOR_LAMP = "Floor Lamp"
+    CANDLE_WARMER_LAMP = "Candle Warmer Lamp"
+    PLUG_MINI_EU = "Plug Mini (EU)"
+    RGBICWW_STRIP_LIGHT = "RGBICWW Strip Light"
+    RGBICWW_FLOOR_LAMP = "RGBICWW Floor Lamp"
+    RGBICWW_LIGHT_BARS = "RGBICWW Light Bars"
+    RGBICWW_CEILING_LIGHT = "RGBICWW Ceiling Light"
+    PERMANENT_OUTDOOR_LIGHT = "Permanent Outdoor Light"
+    RGBIC_NEON_ROPE_LIGHT = "RGBIC Neon Rope Light"
+    RGBIC_NEON_WIRE_ROPE_LIGHT = "RGBIC Neon Wire Rope Light"
+    K11_VACUUM = "K11+ Vacuum"
+    CLIMATE_PANEL = "Climate Panel"
+    SMART_THERMOSTAT_RADIATOR = "Smart Thermostat Radiator"
+    S20_VACUUM = "S20 Vacuum"
+    PRESENCE_SENSOR = "Presence Sensor"
+    ART_FRAME = "Art Frame"
+    KEYPAD_VISION = "Keypad Vision"
+    KEYPAD_VISION_PRO = "Keypad Vision Pro"
+    LOCK_VISION_PRO = "Lock Vision Pro"
+    LOCK_VISION = "Lock Vision"
+    LOCK_PRO_WIFI = "Lock Pro Wifi"
+    LOCK_ULTRA_MAX = "Lock Ultra Max"
+    WEATHER_STATION = "Weather Station"
+
+
+__all__ = [
+    "DEFAULT_RETRY_COUNT",
+    "DEFAULT_RETRY_TIMEOUT",
+    "DEFAULT_SCAN_TIMEOUT",
+    "AirPurifierMode",
+    "AirQualityLevel",
+    "BulbColorMode",
+    "CeilingLightColorMode",
+    "CirculatorFanProMode",
+    "ClimateAction",
+    "ClimateMode",
+    "ColorMode",
+    "FanMode",
+    "HorizontalOscillationAngle",
+    "HumidifierAction",
+    "HumidifierMode",
+    "HumidifierWaterLevel",
+    "LockStatus",
+    "NightLightState",
+    "SmartThermostatRadiatorMode",
+    "StandingFanMode",
+    "StripLightColorMode",
+    "SwitchbotAccountConnectionError",
+    "SwitchbotApiError",
+    "SwitchbotAuthenticationError",
+    "SwitchbotModel",
+    "VerticalOscillationAngle",
+]

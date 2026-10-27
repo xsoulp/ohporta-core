@@ -1,0 +1,1338 @@
+"""Library to handle connection with Switchbot."""
+
+from __future__ import annotations
+
+import asyncio
+import binascii
+import logging
+import time
+from collections.abc import Callable
+from dataclasses import replace
+from enum import IntEnum
+from typing import Any, TypeVar, cast
+from uuid import UUID
+
+import aiohttp
+from bleak.backends.device import BLEDevice
+from bleak.backends.service import BleakGATTCharacteristic, BleakGATTServiceCollection
+from bleak.exc import BleakDBusError
+from bleak_retry_connector import (
+    BLEAK_RETRY_EXCEPTIONS,
+    BleakClientWithServiceCache,
+    BleakNotFoundError,
+    ble_device_has_changed,
+    establish_connection,
+)
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+from ..adv_parser import populate_model_to_mac_cache
+from ..api_config import SWITCHBOT_APP_API_BASE_URL, SWITCHBOT_APP_CLIENT_ID
+from ..const import (
+    DEFAULT_RETRY_COUNT,
+    DEFAULT_SCAN_TIMEOUT,
+    ColorMode,  # noqa: F401
+    SwitchbotAccountConnectionError,
+    SwitchbotApiError,
+    SwitchbotAuthenticationError,
+    SwitchbotModel,
+)
+from ..discovery import GetSwitchbotDevices
+from ..helpers import create_background_task
+from ..models import SwitchBotAdvertisement
+from ..utils import format_mac_upper
+
+_LOGGER = logging.getLogger(__name__)
+
+
+def _extract_region(userinfo: dict[str, Any]) -> str:
+    """Extract region from user info, defaulting to 'us'."""
+    if "botRegion" in userinfo and userinfo["botRegion"] != "":
+        return userinfo["botRegion"]
+    return "us"
+
+
+# Mapping from API model names to SwitchbotModel enum values
+API_MODEL_TO_ENUM: dict[str, SwitchbotModel] = {
+    "WoHand": SwitchbotModel.BOT,
+    "WoCurtain": SwitchbotModel.CURTAIN,
+    "WoCurtain3": SwitchbotModel.CURTAIN,  # Curtain3
+    "WoHumi": SwitchbotModel.HUMIDIFIER,
+    "WoHumi2": SwitchbotModel.EVAPORATIVE_HUMIDIFIER,
+    "WoPlug": SwitchbotModel.PLUG_MINI,
+    "WoPlugUS": SwitchbotModel.PLUG_MINI,
+    "WoContact": SwitchbotModel.CONTACT_SENSOR,
+    "WoStrip": SwitchbotModel.LIGHT_STRIP,
+    "WoMeter": SwitchbotModel.METER,
+    "WoMeterPlus": SwitchbotModel.METER,  # Meter Plus
+    "WoPresence": SwitchbotModel.MOTION_SENSOR,
+    "WoBulb": SwitchbotModel.COLOR_BULB,
+    "WoCeiling": SwitchbotModel.CEILING_LIGHT,
+    "WoCeilingPro": SwitchbotModel.CEILING_LIGHT,  # Ceiling Light Pro
+    "WoLock": SwitchbotModel.LOCK,
+    "WoLockPro": SwitchbotModel.LOCK_PRO,
+    "WoLockLite": SwitchbotModel.LOCK_LITE,
+    "WoBlindTilt": SwitchbotModel.BLIND_TILT,
+    "WoIOSensor": SwitchbotModel.IO_METER,  # Outdoor Meter
+    "WoButton": SwitchbotModel.REMOTE,  # Remote button
+    "WoUniversalRemote": SwitchbotModel.UNIVERSAL_REMOTE,  # Universal Remote
+    "WoLinkMini": SwitchbotModel.HUBMINI_MATTER,  # Hub Mini
+    "WoFan2": SwitchbotModel.CIRCULATOR_FAN,
+    "WoHub2": SwitchbotModel.HUB2,
+    "WoRollerShade": SwitchbotModel.ROLLER_SHADE,
+    "WoAirPurifierJP": SwitchbotModel.AIR_PURIFIER_JP,
+    "WoAirPurifierUS": SwitchbotModel.AIR_PURIFIER_US,
+    "WoAirPurifierJPPro": SwitchbotModel.AIR_PURIFIER_TABLE_JP,
+    "WoAirPurifierUSPro": SwitchbotModel.AIR_PURIFIER_TABLE_US,
+    "WoSweeperMini": SwitchbotModel.K10_VACUUM,
+    "WoSweeperMiniPro": SwitchbotModel.K10_PRO_VACUUM,
+    "91AgWZ1n": SwitchbotModel.K10_PRO_COMBO_VACUUM,
+    "W1113000": SwitchbotModel.K11_VACUUM,
+    "sH5cQeLF": SwitchbotModel.K20_VACUUM,
+    "WoSweeperOrigin": SwitchbotModel.S10_VACUUM,
+    "W1106000": SwitchbotModel.S20_VACUUM,
+    "W1083000": SwitchbotModel.RELAY_SWITCH_1PM,
+    "W1083001": SwitchbotModel.RELAY_SWITCH_2PM,
+    "W1083002": SwitchbotModel.RELAY_SWITCH_1,  # Relay Switch 1
+    "W1079000": SwitchbotModel.METER_PRO,  # Meter Pro (another variant)
+    "W1079001": SwitchbotModel.METER_PRO_C,
+    "W1101000": SwitchbotModel.PRESENCE_SENSOR,
+    "W1091000": SwitchbotModel.LOCK_ULTRA,
+    "W1096000": SwitchbotModel.HUB3,
+    "W1083003": SwitchbotModel.GARAGE_DOOR_OPENER,
+    "W1102000": SwitchbotModel.FLOOR_LAMP,
+    "W1102001": SwitchbotModel.STRIP_LIGHT_3,
+    "W1102003": SwitchbotModel.RGBICWW_STRIP_LIGHT,
+    "W1102004": SwitchbotModel.RGBICWW_FLOOR_LAMP,
+    "W1163000": SwitchbotModel.RGBICWW_LIGHT_BARS,
+    "W1162000": SwitchbotModel.RGBICWW_CEILING_LIGHT,
+    "W1160000": SwitchbotModel.CIRCULATOR_FAN_PRO,
+    "W1104000": SwitchbotModel.PLUG_MINI_EU,
+    "W1128000": SwitchbotModel.SMART_THERMOSTAT_RADIATOR,
+    "W1111000": SwitchbotModel.CLIMATE_PANEL,
+    "W1130000": SwitchbotModel.ART_FRAME,
+    "W1141001": SwitchbotModel.LOCK_VISION_PRO,
+    "W1141000": SwitchbotModel.LOCK_VISION,
+    "W1114000": SwitchbotModel.LOCK_PRO_WIFI,
+}
+
+REQ_HEADER = "570f"
+
+
+# Keys common to all device types
+DEVICE_GET_BASIC_SETTINGS_KEY = "5702"
+DEVICE_SET_MODE_KEY = "5703"
+DEVICE_SET_EXTENDED_KEY = REQ_HEADER
+COMMAND_GET_CK_IV = f"{REQ_HEADER}2103"
+
+# Base key when encryption is set
+KEY_PASSWORD_PREFIX = "571"
+
+DBUS_ERROR_BACKOFF_TIME = 0.25
+
+# How long to hold the connection
+# to wait for additional commands for
+# disconnecting the device.
+DISCONNECT_DELAY = 8.5
+
+
+# If the scanner is in passive mode, we
+# need to poll the device to get the
+# battery and a few rarely updating
+# values.
+PASSIVE_POLL_INTERVAL = 60 * 60 * 24
+
+
+class CharacteristicMissingError(Exception):
+    """Raised when a characteristic is missing."""
+
+
+class SwitchbotOperationError(Exception):
+    """Raised when an operation fails."""
+
+
+class AESMode(IntEnum):
+    """Supported AES modes for encrypted devices."""
+
+    CTR = 0
+    GCM = 1
+
+
+def _normalize_encryption_mode(mode: int) -> AESMode:
+    """Normalize encryption mode to AESMode (only 0/1 allowed)."""
+    try:
+        return AESMode(mode)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Unsupported encryption mode: {mode}") from exc
+
+
+def _sb_uuid(comms_type: str = "service") -> UUID | str:
+    """Return Switchbot UUID."""
+    _uuid = {"tx": "002", "rx": "003", "service": "d00"}
+
+    if comms_type in _uuid:
+        return UUID(f"cba20{_uuid[comms_type]}-224d-11e6-9fb8-0002a5d5c51b")
+
+    return "Incorrect type, choose between: tx, rx or service"
+
+
+READ_CHAR_UUID = _sb_uuid(comms_type="rx")
+WRITE_CHAR_UUID = _sb_uuid(comms_type="tx")
+
+
+WrapFuncType = TypeVar("WrapFuncType", bound=Callable[..., Any])
+
+
+def update_after_operation(func: WrapFuncType) -> WrapFuncType:
+    """Define a wrapper to update after an operation."""
+
+    async def _async_update_after_operation_wrap(
+        self: SwitchbotBaseDevice, *args: Any, **kwargs: Any
+    ) -> None:
+        ret = await func(self, *args, **kwargs)
+        await self.update()
+        return ret
+
+    return cast(WrapFuncType, _async_update_after_operation_wrap)
+
+
+def _merge_data(old_data: dict[str, Any], new_data: dict[str, Any]) -> dict[str, Any]:
+    """Merge data but only add None keys if they are missing."""
+    merged = old_data.copy()
+    for key, value in new_data.items():
+        if isinstance(value, dict) and isinstance(old_data.get(key), dict):
+            merged[key] = _merge_data(old_data[key], value)
+        elif value is not None or key not in old_data:
+            merged[key] = value
+    return merged
+
+
+def _handle_timeout(fut: asyncio.Future[None]) -> None:
+    """Handle a timeout."""
+    if not fut.done():
+        fut.set_exception(asyncio.TimeoutError)
+
+
+class SwitchbotBaseDevice:
+    """Base Representation of a Switchbot Device."""
+
+    _turn_on_command: str | None = None
+    _turn_off_command: str | None = None
+    _open_command: str | None = None
+    _close_command: str | None = None
+    _press_command: str | None = None
+    _open_child_lock_command: str | None = None
+    _close_child_lock_command: str | None = None
+
+    def __init__(
+        self,
+        device: BLEDevice,
+        password: str | None = None,
+        interface: int = 0,
+        **kwargs: Any,
+    ) -> None:
+        """Switchbot base class constructor."""
+        self._interface = f"hci{interface}"
+        self._device = device
+        self._sb_adv_data: SwitchBotAdvertisement | None = None
+        self._override_adv_data: dict[str, Any] | None = None
+        self._scan_timeout: int = kwargs.pop("scan_timeout", DEFAULT_SCAN_TIMEOUT)
+        self._retry_count: int = kwargs.pop("retry_count", DEFAULT_RETRY_COUNT)
+        self._connect_lock = asyncio.Lock()
+        self._operation_lock = asyncio.Lock()
+        if password is None or password == "":
+            self._password_encoded = None
+        else:
+            self._password_encoded = "%08x" % (
+                binascii.crc32(password.encode("ascii")) & 0xFFFFFFFF
+            )
+        self._client: BleakClientWithServiceCache | None = None
+        self._read_char: BleakGATTCharacteristic | None = None
+        self._write_char: BleakGATTCharacteristic | None = None
+        self._disconnect_timer: asyncio.TimerHandle | None = None
+        self._expected_disconnect = False
+        self._callbacks: list[Callable[[], None]] = []
+        self._notify_future: asyncio.Future[bytearray] | None = None
+        self._last_full_update: float = -PASSIVE_POLL_INTERVAL
+        self._timed_disconnect_task: asyncio.Task[None] | None = None
+
+    @classmethod
+    async def _async_get_user_info(
+        cls,
+        session: aiohttp.ClientSession,
+        auth_headers: dict[str, str],
+    ) -> dict[str, Any]:
+        try:
+            return await cls.api_request(
+                session, "account", "account/api/v1/user/userinfo", {}, auth_headers
+            )
+        except Exception as err:
+            raise SwitchbotAccountConnectionError(
+                f"Failed to retrieve SwitchBot Account user details: {err}"
+            ) from err
+
+    @classmethod
+    async def _get_auth_result(
+        cls,
+        session: aiohttp.ClientSession,
+        username: str,
+        password: str,
+    ) -> dict[str, Any]:
+        """Authenticate with SwitchBot API."""
+        try:
+            return await cls.api_request(
+                session,
+                "account",
+                "account/api/v1/user/login",
+                {
+                    "clientId": SWITCHBOT_APP_CLIENT_ID,
+                    "username": username,
+                    "password": password,
+                    "grantType": "password",
+                    "verifyCode": "",
+                },
+            )
+        except Exception as err:
+            raise SwitchbotAuthenticationError(f"Authentication failed: {err}") from err
+
+    @classmethod
+    async def get_devices(
+        cls,
+        session: aiohttp.ClientSession,
+        username: str,
+        password: str,
+    ) -> dict[str, SwitchbotModel]:
+        """Get devices from SwitchBot API and return formatted MAC to model mapping."""
+        try:
+            auth_result = await cls._get_auth_result(session, username, password)
+            auth_headers = {"authorization": auth_result["access_token"]}
+        except Exception as err:
+            raise SwitchbotAuthenticationError(f"Authentication failed: {err}") from err
+
+        userinfo = await cls._async_get_user_info(session, auth_headers)
+        region = _extract_region(userinfo)
+
+        try:
+            device_info = await cls.api_request(
+                session,
+                f"wonderlabs.{region}",
+                "wonder/device/v3/getdevice",
+                {
+                    "required_type": "All",
+                },
+                auth_headers,
+            )
+        except Exception as err:
+            raise SwitchbotAccountConnectionError(
+                f"Failed to retrieve devices from SwitchBot Account: {err}"
+            ) from err
+
+        items: list[dict[str, Any]] = device_info["Items"]
+        mac_to_model: dict[str, SwitchbotModel] = {}
+
+        for item in items:
+            if "device_mac" not in item:
+                continue
+
+            if (
+                "device_detail" not in item
+                or "device_type" not in item["device_detail"]
+            ):
+                continue
+
+            mac = item["device_mac"]
+            model_name = item["device_detail"]["device_type"]
+
+            # Format MAC to uppercase with colons
+            formatted_mac = format_mac_upper(mac)
+
+            # Map API model name to SwitchbotModel enum if possible
+            if model_name in API_MODEL_TO_ENUM:
+                model = API_MODEL_TO_ENUM[model_name]
+                mac_to_model[formatted_mac] = model
+                # Populate the cache
+                populate_model_to_mac_cache(formatted_mac, model)
+            else:
+                # Log the full item payload for unknown models
+                _LOGGER.debug(
+                    "Unknown model %s for device %s, full item: %s",
+                    model_name,
+                    formatted_mac,
+                    item,
+                )
+
+        return mac_to_model
+
+    @classmethod
+    async def api_request(
+        cls,
+        session: aiohttp.ClientSession,
+        subdomain: str,
+        path: str,
+        data: dict | None = None,
+        headers: dict | None = None,
+    ) -> dict:
+        url = f"https://{subdomain}.{SWITCHBOT_APP_API_BASE_URL}/{path}"
+        async with session.post(
+            url,
+            json=data,
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as result:
+            if result.status > 299:
+                raise SwitchbotApiError(
+                    f"Unexpected status code returned by SwitchBot API: {result.status}"
+                )
+
+            response = await result.json()
+            if response["statusCode"] != 100:
+                raise SwitchbotApiError(
+                    f"{response['message']}, status code: {response['statusCode']}"
+                )
+
+            return response["body"]
+
+    def advertisement_changed(self, advertisement: SwitchBotAdvertisement) -> bool:
+        """Check if the advertisement has changed."""
+        return bool(
+            not self._sb_adv_data
+            or ble_device_has_changed(self._sb_adv_data.device, advertisement.device)
+            or advertisement.data != self._sb_adv_data.data
+        )
+
+    def _commandkey(self, key: str) -> str:
+        """Add password to key if set."""
+        if self._password_encoded is None:
+            return key
+        key_action = key[3]
+        key_suffix = key[4:]
+        return KEY_PASSWORD_PREFIX + key_action + self._password_encoded + key_suffix
+
+    async def _send_command_locked_with_retry(
+        self, key: str, command: bytes, retry: int, max_attempts: int
+    ) -> bytes | None:
+        for attempt in range(max_attempts):
+            try:
+                return await self._send_command_locked(key, command)
+            except BleakNotFoundError:
+                _LOGGER.error(
+                    "%s: device not found, no longer in range, or poor RSSI: %s",
+                    self.name,
+                    self.rssi,
+                    exc_info=True,
+                )
+                raise
+            except CharacteristicMissingError as ex:
+                if attempt == retry:
+                    _LOGGER.error(
+                        "%s: characteristic missing: %s; Stopping trying; RSSI: %s",
+                        self.name,
+                        ex,
+                        self.rssi,
+                        exc_info=True,
+                    )
+                    raise
+
+                _LOGGER.debug(
+                    "%s: characteristic missing: %s; RSSI: %s",
+                    self.name,
+                    ex,
+                    self.rssi,
+                    exc_info=True,
+                )
+            except BLEAK_RETRY_EXCEPTIONS:
+                if attempt == retry:
+                    _LOGGER.error(
+                        "%s: communication failed; Stopping trying; RSSI: %s",
+                        self.name,
+                        self.rssi,
+                        exc_info=True,
+                    )
+                    raise
+
+                _LOGGER.debug(
+                    "%s: communication failed with:", self.name, exc_info=True
+                )
+
+        raise RuntimeError("Unreachable")
+
+    async def _send_command(self, key: str, retry: int | None = None) -> bytes | None:
+        """Send command to device and read response."""
+        if retry is None:
+            retry = self._retry_count
+        command = bytearray.fromhex(self._commandkey(key))
+        _LOGGER.debug("%s: Scheduling command %s", self.name, command.hex())
+        max_attempts = retry + 1
+        if self._operation_lock.locked():
+            _LOGGER.debug(
+                "%s: Operation already in progress, waiting for it to complete; RSSI: %s",
+                self.name,
+                self.rssi,
+            )
+        async with self._operation_lock:
+            return await self._send_command_locked_with_retry(
+                key, command, retry, max_attempts
+            )
+
+    @property
+    def name(self) -> str:
+        """Return device name."""
+        return f"{self._device.name} ({self._device.address})"
+
+    @property
+    def data(self) -> dict[str, Any]:
+        """Return device data."""
+        if self._sb_adv_data:
+            return self._sb_adv_data.data
+        return {}
+
+    @property
+    def parsed_data(self) -> dict[str, Any]:
+        """Return parsed device data."""
+        return self.data.get("data") or {}
+
+    @property
+    def rssi(self) -> int:
+        """Return RSSI of device."""
+        if self._sb_adv_data:
+            return self._sb_adv_data.rssi
+        return -127
+
+    async def _ensure_connected(self):
+        """Ensure connection to device is established."""
+        if self._connect_lock.locked():
+            _LOGGER.debug(
+                "%s: Connection already in progress, waiting for it to complete; RSSI: %s",
+                self.name,
+                self.rssi,
+            )
+        if self._client and self._client.is_connected:
+            _LOGGER.debug(
+                "%s: Already connected before obtaining lock, resetting timer; RSSI: %s",
+                self.name,
+                self.rssi,
+            )
+            self._reset_disconnect_timer()
+            return
+        async with self._connect_lock:
+            # Check again while holding the lock
+            if self._client and self._client.is_connected:
+                _LOGGER.debug(
+                    "%s: Already connected after obtaining lock, resetting timer; RSSI: %s",
+                    self.name,
+                    self.rssi,
+                )
+                self._reset_disconnect_timer()
+                return
+            _LOGGER.debug("%s: Connecting; RSSI: %s", self.name, self.rssi)
+            client: BleakClientWithServiceCache = await establish_connection(
+                BleakClientWithServiceCache,
+                self._device,
+                self.name,
+                self._disconnected,
+                use_services_cache=True,
+                ble_device_callback=lambda: self._device,
+            )
+            _LOGGER.debug("%s: Connected; RSSI: %s", self.name, self.rssi)
+            self._client = client
+
+            try:
+                self._resolve_characteristics(client.services)
+            except CharacteristicMissingError as ex:
+                _LOGGER.debug(
+                    "%s: characteristic missing, clearing cache: %s; RSSI: %s",
+                    self.name,
+                    ex,
+                    self.rssi,
+                    exc_info=True,
+                )
+                await client.clear_cache()
+                self._cancel_disconnect_timer()
+                await self._execute_disconnect_with_lock()
+                raise
+
+            _LOGGER.debug(
+                "%s: Starting notify and disconnect timer; RSSI: %s",
+                self.name,
+                self.rssi,
+            )
+            self._reset_disconnect_timer()
+            await self._start_notify()
+
+    def _resolve_characteristics(self, services: BleakGATTServiceCollection) -> None:
+        """Resolve characteristics."""
+        self._read_char = services.get_characteristic(READ_CHAR_UUID)
+        if not self._read_char:
+            raise CharacteristicMissingError(READ_CHAR_UUID)
+        self._write_char = services.get_characteristic(WRITE_CHAR_UUID)
+        if not self._write_char:
+            raise CharacteristicMissingError(WRITE_CHAR_UUID)
+
+    def _reset_disconnect_timer(self):
+        """Reset disconnect timer."""
+        self._cancel_disconnect_timer()
+        self._expected_disconnect = False
+        self._disconnect_timer = asyncio.get_running_loop().call_later(
+            DISCONNECT_DELAY, self._disconnect_from_timer
+        )
+
+    def _disconnected(self, client: BleakClientWithServiceCache) -> None:
+        """Disconnected callback."""
+        if self._expected_disconnect:
+            _LOGGER.debug(
+                "%s: Disconnected from device; RSSI: %s", self.name, self.rssi
+            )
+            return
+        _LOGGER.warning(
+            "%s: Device unexpectedly disconnected; RSSI: %s",
+            self.name,
+            self.rssi,
+        )
+        self._cancel_disconnect_timer()
+
+    def _disconnect_from_timer(self):
+        """Disconnect from device."""
+        if self._operation_lock.locked() and self._client.is_connected:
+            _LOGGER.debug(
+                "%s: Operation in progress, resetting disconnect timer; RSSI: %s",
+                self.name,
+                self.rssi,
+            )
+            self._reset_disconnect_timer()
+            return
+        self._cancel_disconnect_timer()
+        self._timed_disconnect_task = asyncio.create_task(
+            self._execute_timed_disconnect()
+        )
+
+    def _cancel_disconnect_timer(self):
+        """Cancel disconnect timer."""
+        if self._disconnect_timer:
+            self._disconnect_timer.cancel()
+            self._disconnect_timer = None
+
+    async def _execute_forced_disconnect(self) -> None:
+        """Execute forced disconnection."""
+        self._cancel_disconnect_timer()
+        _LOGGER.debug(
+            "%s: Executing forced disconnect",
+            self.name,
+        )
+        await self._execute_disconnect()
+
+    async def _execute_timed_disconnect(self) -> None:
+        """Execute timed disconnection."""
+        _LOGGER.debug(
+            "%s: Executing timed disconnect after timeout of %s",
+            self.name,
+            DISCONNECT_DELAY,
+        )
+        await self._execute_disconnect()
+
+    async def _execute_disconnect(self) -> None:
+        """Execute disconnection."""
+        _LOGGER.debug("%s: Executing disconnect", self.name)
+        async with self._connect_lock:
+            await self._execute_disconnect_with_lock()
+
+    async def _execute_disconnect_with_lock(self) -> None:
+        """Execute disconnection while holding the lock."""
+        assert self._connect_lock.locked(), "Lock not held"
+        _LOGGER.debug("%s: Executing disconnect with lock", self.name)
+        if self._disconnect_timer:  # If the timer was reset, don't disconnect
+            _LOGGER.debug("%s: Skipping disconnect as timer reset", self.name)
+            return
+        client = self._client
+        self._expected_disconnect = True
+        self._client = None
+        self._read_char = None
+        self._write_char = None
+        if not client:
+            _LOGGER.debug("%s: Already disconnected", self.name)
+            return
+        _LOGGER.debug("%s: Disconnecting", self.name)
+        try:
+            await client.disconnect()
+        except BLEAK_RETRY_EXCEPTIONS as ex:
+            _LOGGER.warning(
+                "%s: Error disconnecting: %s; RSSI: %s",
+                self.name,
+                ex,
+                self.rssi,
+            )
+        else:
+            _LOGGER.debug("%s: Disconnect completed successfully", self.name)
+
+    async def _send_command_locked(self, key: str, command: bytes) -> bytes:
+        """Send command to device and read response."""
+        await self._ensure_connected()
+        try:
+            return await self._execute_command_locked(key, command)
+        except BleakDBusError as ex:
+            # Disconnect so we can reset state and try again
+            await asyncio.sleep(DBUS_ERROR_BACKOFF_TIME)
+            _LOGGER.debug(
+                "%s: RSSI: %s; Backing off %ss; Disconnecting due to error: %s",
+                self.name,
+                self.rssi,
+                DBUS_ERROR_BACKOFF_TIME,
+                ex,
+            )
+            await self._execute_forced_disconnect()
+            raise
+        except BLEAK_RETRY_EXCEPTIONS as ex:
+            # Disconnect so we can reset state and try again
+            _LOGGER.debug(
+                "%s: RSSI: %s; Disconnecting due to error: %s", self.name, self.rssi, ex
+            )
+            await self._execute_forced_disconnect()
+            raise
+
+    def _notification_handler(self, _sender: int, data: bytearray) -> None:
+        """Handle notification responses."""
+        if self._notify_future and not self._notify_future.done():
+            self._notify_future.set_result(data)
+            return
+        _LOGGER.debug("%s: Received unsolicited notification: %s", self.name, data)
+
+    async def _start_notify(self) -> None:
+        """Start notification."""
+        _LOGGER.debug("%s: Subscribe to notifications; RSSI: %s", self.name, self.rssi)
+        await self._client.start_notify(self._read_char, self._notification_handler)
+
+    async def _execute_command_locked(self, key: str, command: bytes) -> bytes:
+        """Execute command and read response."""
+        assert self._client is not None
+        assert self._read_char is not None
+        assert self._write_char is not None
+        loop = asyncio.get_running_loop()
+        self._notify_future = loop.create_future()
+        client = self._client
+
+        _LOGGER.debug("%s: Sending command: %s", self.name, key)
+        await client.write_gatt_char(self._write_char, command, False)
+
+        timeout = 5
+        timeout_handle = loop.call_at(
+            loop.time() + timeout, _handle_timeout, self._notify_future
+        )
+        timeout_expired = False
+        try:
+            notify_msg = await self._notify_future
+        except TimeoutError:
+            timeout_expired = True
+            raise
+        finally:
+            if not timeout_expired:
+                timeout_handle.cancel()
+            self._notify_future = None
+
+        _LOGGER.debug("%s: Notification received: %s", self.name, notify_msg.hex())
+
+        if notify_msg == b"\x07":
+            _LOGGER.error("Password required")
+        elif notify_msg == b"\t":
+            _LOGGER.error("Password incorrect")
+        return notify_msg
+
+    def get_address(self) -> str:
+        """Return address of device."""
+        return self._device.address
+
+    def _override_state(self, state: dict[str, Any]) -> None:
+        """Override device state."""
+        if self._override_adv_data is None:
+            self._override_adv_data = {}
+        self._override_adv_data.update(state)
+        self._update_parsed_data(state)
+
+    def _get_adv_value(self, key: str, channel: int | None = None) -> Any:
+        """Return value from advertisement data."""
+        if self._override_adv_data and key in self._override_adv_data:
+            _LOGGER.debug(
+                "%s: Using override value for %s: %s",
+                self.name,
+                key,
+                self._override_adv_data[key],
+            )
+            return self._override_adv_data[key]
+        if not self._sb_adv_data:
+            return None
+        if channel is not None:
+            return self._sb_adv_data.data["data"].get(channel, {}).get(key)
+        return self._sb_adv_data.data["data"].get(key)
+
+    def get_battery_percent(self) -> Any:
+        """Return device battery level in percent."""
+        return self._get_adv_value("battery")
+
+    def update_from_advertisement(self, advertisement: SwitchBotAdvertisement) -> None:
+        """Update device data from advertisement."""
+        # Only accept advertisements if the data is not missing
+        # if we already have an advertisement with data
+        self._device = advertisement.device
+
+    async def get_device_data(
+        self, retry: int | None = None, interface: int | None = None
+    ) -> SwitchBotAdvertisement | None:
+        """Find switchbot devices and their advertisement data."""
+        if retry is None:
+            retry = self._retry_count
+
+        if interface:
+            _interface: int = interface
+        else:
+            _interface = int(self._interface.replace("hci", ""))
+
+        _data = await GetSwitchbotDevices(interface=_interface).discover(
+            retry=retry, scan_timeout=self._scan_timeout
+        )
+
+        if self._device.address in _data:
+            self._sb_adv_data = _data[self._device.address]
+
+        return self._sb_adv_data
+
+    async def _get_basic_info(
+        self, cmd: str = DEVICE_GET_BASIC_SETTINGS_KEY
+    ) -> bytes | None:
+        """Return basic info of device."""
+        _data = await self._send_command(key=cmd, retry=self._retry_count)
+
+        if _data in (b"\x07", b"\x00"):
+            _LOGGER.error("Unsuccessful, please try again")
+            return None
+
+        return _data
+
+    def _fire_callbacks(self) -> None:
+        """Fire callbacks."""
+        _LOGGER.debug("%s: Fire callbacks", self.name)
+        for callback in self._callbacks:
+            callback()
+
+    def subscribe(self, callback: Callable[[], None]) -> Callable[[], None]:
+        """Subscribe to device notifications."""
+        self._callbacks.append(callback)
+
+        def _unsub() -> None:
+            """Unsubscribe from device notifications."""
+            self._callbacks.remove(callback)
+
+        return _unsub
+
+    async def update(self, interface: int | None = None) -> None:
+        """Update position, battery percent and light level of device."""
+        if info := await self.get_basic_info():
+            self._last_full_update = time.monotonic()
+            self._update_parsed_data(info)
+            self._fire_callbacks()
+
+    async def get_basic_info(self) -> dict[str, Any] | None:
+        """Get device basic settings."""
+        if not (_data := await self._get_basic_info()):
+            return None
+        return {
+            "battery": _data[1],
+            "firmware": _data[2] / 10.0,
+        }
+
+    def _check_command_result(
+        self, result: bytes | None, index: int, values: set[int]
+    ) -> bool:
+        """Check command result."""
+        if not result or len(result) - 1 < index:
+            result_hex = result.hex() if result else "None"
+            raise SwitchbotOperationError(
+                f"{self.name}: Sending command failed (result={result_hex} index={index} expected={values} rssi={self.rssi})"
+            )
+        return result[index] in values
+
+    def _update_parsed_data(self, new_data: dict[str, Any]) -> bool:
+        """
+        Update data.
+
+        Returns true if data has changed and False if not.
+        """
+        if not self._sb_adv_data:
+            _LOGGER.debug("%s: No advertisement data to update", self.name)
+            return False
+        old_data = self._sb_adv_data.data.get("data") or {}
+        merged_data = _merge_data(old_data, new_data)
+        if merged_data == old_data:
+            return False
+        self._set_parsed_data(self._sb_adv_data, merged_data)
+        return True
+
+    def _set_parsed_data(
+        self, advertisement: SwitchBotAdvertisement, data: dict[str, Any]
+    ) -> None:
+        """Set data."""
+        self._sb_adv_data = replace(
+            advertisement, data=self._sb_adv_data.data | {"data": data}
+        )
+
+    def _set_advertisement_data(self, advertisement: SwitchBotAdvertisement) -> None:
+        """Set advertisement data."""
+        new_data = advertisement.data.get("data") or {}
+        if advertisement.active:
+            # If we are getting active data, we can assume we are
+            # getting active scans and we do not need to poll
+            self._last_full_update = time.monotonic()
+        if not self._sb_adv_data:
+            self._sb_adv_data = advertisement
+        elif new_data:
+            self._update_parsed_data(new_data)
+        self._override_adv_data = None
+
+    def switch_mode(self) -> bool | None:
+        """Return true or false from cache."""
+        # To get actual position call update() first.
+        return self._get_adv_value("switchMode")
+
+    def poll_needed(self, seconds_since_last_poll: float | None) -> bool:
+        """Return if device needs polling."""
+        if (
+            seconds_since_last_poll is not None
+            and seconds_since_last_poll < PASSIVE_POLL_INTERVAL
+        ):
+            return False
+        time_since_last_full_update = time.monotonic() - self._last_full_update
+        return not time_since_last_full_update < PASSIVE_POLL_INTERVAL
+
+    def _check_function_support(self, cmd: str | None = None) -> None:
+        """Check if the command is supported by the device model."""
+        if not cmd:
+            raise SwitchbotOperationError(
+                f"Current device {self._device.address} does not support this functionality"
+            )
+
+    @update_after_operation
+    async def turn_on(self) -> bool:
+        """Turn device on."""
+        self._check_function_support(self._turn_on_command)
+        result = await self._send_command(self._turn_on_command)
+        return self._check_command_result(result, 0, {1})
+
+    @update_after_operation
+    async def turn_off(self) -> bool:
+        """Turn device off."""
+        self._check_function_support(self._turn_off_command)
+        result = await self._send_command(self._turn_off_command)
+        return self._check_command_result(result, 0, {1})
+
+    @update_after_operation
+    async def open(self) -> bool:
+        """Open the device."""
+        self._check_function_support(self._open_command)
+        result = await self._send_command(self._open_command)
+        return self._check_command_result(result, 0, {1})
+
+    @update_after_operation
+    async def close(self) -> bool:
+        """Close the device."""
+        self._check_function_support(self._close_command)
+        result = await self._send_command(self._close_command)
+        return self._check_command_result(result, 0, {1})
+
+    @update_after_operation
+    async def press(self) -> bool:
+        """Press the device."""
+        self._check_function_support(self._press_command)
+        result = await self._send_command(self._press_command)
+        return self._check_command_result(result, 0, {1})
+
+    @update_after_operation
+    async def open_child_lock(self) -> bool:
+        """Open the child lock."""
+        self._check_function_support(self._open_child_lock_command)
+        result = await self._send_command(self._open_child_lock_command)
+        return self._check_command_result(result, 0, {1})
+
+    @update_after_operation
+    async def close_child_lock(self) -> bool:
+        """Close the child lock."""
+        self._check_function_support(self._close_child_lock_command)
+        result = await self._send_command(self._close_child_lock_command)
+        return self._check_command_result(result, 0, {1})
+
+
+class SwitchbotDevice(SwitchbotBaseDevice):
+    """
+    Base Representation of a Switchbot Device.
+
+    This base class consumes the advertisement data during connection. If the device
+    sends stale advertisement data while connected, use
+    SwitchbotDeviceOverrideStateDuringConnection instead.
+    """
+
+    def update_from_advertisement(self, advertisement: SwitchBotAdvertisement) -> None:
+        """Update device data from advertisement."""
+        super().update_from_advertisement(advertisement)
+        self._set_advertisement_data(advertisement)
+
+    async def _send_multiple_commands(self, keys: list[str]) -> bool:
+        """
+        Send multiple commands to device.
+
+        Returns True if any command succeeds. Used when we don't know
+        which command the device needs, so we send multiple and consider
+        it successful if any one works.
+        """
+        final_result = False
+        for key in keys:
+            result = await self._send_command(key)
+            final_result |= self._check_command_result(result, 0, {1})
+        return final_result
+
+    async def _send_command_sequence(self, keys: list[str]) -> bool:
+        """
+        Send a sequence of commands to device where all must succeed.
+
+        Returns True only if all commands succeed.
+        """
+        for key in keys:
+            result = await self._send_command(key)
+            if not self._check_command_result(result, 0, {1}):
+                return False
+        return True
+
+
+class SwitchbotEncryptedDevice(SwitchbotDevice):
+    """A Switchbot device that uses encryption."""
+
+    _model: SwitchbotModel | None = None
+
+    def __init__(
+        self,
+        device: BLEDevice,
+        key_id: str,
+        encryption_key: str,
+        interface: int = 0,
+        model: SwitchbotModel | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Switchbot base class constructor for encrypted devices."""
+        if model is None:
+            model = self._model
+        if model is None:
+            raise ValueError("model must be provided or set on the subclass as _model")
+        if len(key_id) == 0:
+            raise ValueError("key_id is missing")
+        if len(key_id) != 2:
+            raise ValueError("key_id is invalid")
+        if len(encryption_key) == 0:
+            raise ValueError("encryption_key is missing")
+        if len(encryption_key) != 32:
+            raise ValueError("encryption_key is invalid")
+        self._key_id = key_id
+        self._encryption_key = bytearray.fromhex(encryption_key)
+        self._iv: bytes | None = None
+        self._cipher: Cipher | None = None
+        self._encryption_mode: AESMode | None = None
+        super().__init__(device, None, interface, **kwargs)
+        self._model = model
+
+    # Old non-async method preserved for backwards compatibility
+    @classmethod
+    def retrieve_encryption_key(cls, device_mac: str, username: str, password: str):
+        async def async_fn():
+            async with aiohttp.ClientSession() as session:
+                return await cls.async_retrieve_encryption_key(
+                    session, device_mac, username, password
+                )
+
+        return asyncio.run(async_fn())
+
+    @classmethod
+    async def async_retrieve_encryption_key(
+        cls,
+        session: aiohttp.ClientSession,
+        device_mac: str,
+        username: str,
+        password: str,
+    ) -> dict:
+        """Retrieve lock key from internal SwitchBot API."""
+        device_mac = device_mac.replace(":", "").replace("-", "").upper()
+
+        try:
+            auth_result = await cls._get_auth_result(session, username, password)
+            auth_headers = {"authorization": auth_result["access_token"]}
+        except Exception as err:
+            raise SwitchbotAuthenticationError(f"Authentication failed: {err}") from err
+
+        userinfo = await cls._async_get_user_info(session, auth_headers)
+        region = _extract_region(userinfo)
+
+        try:
+            device_info = await cls.api_request(
+                session,
+                f"wonderlabs.{region}",
+                "wonder/keys/v1/communicate",
+                {
+                    "device_mac": device_mac,
+                    "keyType": "user",
+                },
+                auth_headers,
+            )
+
+            return {
+                "key_id": device_info["communicationKey"]["keyId"],
+                "encryption_key": device_info["communicationKey"]["key"],
+            }
+        except Exception as err:
+            raise SwitchbotAccountConnectionError(
+                f"Failed to retrieve encryption key from SwitchBot Account: {err}"
+            ) from err
+
+    @classmethod
+    async def verify_encryption_key(
+        cls,
+        device: BLEDevice,
+        key_id: str,
+        encryption_key: str,
+        model: SwitchbotModel | None = None,
+        **kwargs: Any,
+    ) -> bool:
+        if model is None:
+            model = cls._model
+        if model is None:
+            raise ValueError("model must be provided or set on the subclass as _model")
+        try:
+            switchbot_device = cls(
+                device,
+                key_id=key_id,
+                encryption_key=encryption_key,
+                model=model,
+                **kwargs,
+            )
+        except ValueError:
+            return False
+        try:
+            info = await switchbot_device.get_basic_info()
+        except SwitchbotOperationError:
+            return False
+
+        return info is not None
+
+    async def _send_command(
+        self, key: str, retry: int | None = None, encrypt: bool = True
+    ) -> bytes | None:
+        if not encrypt:
+            return await super()._send_command(key[:2] + "000000" + key[2:], retry)
+
+        if retry is None:
+            retry = self._retry_count
+
+        if self._operation_lock.locked():
+            _LOGGER.debug(
+                "%s: Operation already in progress, waiting for it to complete; RSSI: %s",
+                self.name,
+                self.rssi,
+            )
+
+        async with self._operation_lock:
+            if not (result := await self._ensure_encryption_initialized()):
+                _LOGGER.error("Failed to initialize encryption")
+                return None
+
+            ciphertext_hex, header_hex = self._encrypt(key[2:])
+            encrypted = key[:2] + self._key_id + header_hex + ciphertext_hex
+            command = bytearray.fromhex(self._commandkey(encrypted))
+            _LOGGER.debug("%s: Scheduling command %s", self.name, command.hex())
+            max_attempts = retry + 1
+
+            result = await self._send_command_locked_with_retry(
+                encrypted, command, retry, max_attempts
+            )
+            if result is None:
+                return None
+            decrypted = self._decrypt(result[4:])
+            if self._encryption_mode == AESMode.GCM:
+                self._increment_gcm_iv()
+            return result[:1] + decrypted
+
+    async def _ensure_encryption_initialized(self) -> bool:
+        """Ensure encryption is initialized, must be called with operation lock held."""
+        assert self._operation_lock.locked(), "Operation lock must be held"
+
+        if self._iv is not None:
+            return True
+
+        _LOGGER.debug("%s: Initializing encryption", self.name)
+        # Call parent's _send_command_locked_with_retry directly since we already hold the lock
+        key = COMMAND_GET_CK_IV + self._key_id
+        command = bytearray.fromhex(self._commandkey(key[:2] + "000000" + key[2:]))
+
+        result = await self._send_command_locked_with_retry(
+            key[:2] + "000000" + key[2:],
+            command,
+            self._retry_count,
+            self._retry_count + 1,
+        )
+        if result is None:
+            return False
+
+        if ok := self._check_command_result(result, 0, {1}):
+            _LOGGER.debug("%s: Encryption init response: %s", self.name, result.hex())
+            mode_byte = result[2] if len(result) > 2 else None
+            self._resolve_encryption_mode(mode_byte)
+            if self._encryption_mode == AESMode.GCM:
+                iv = result[4:-4]
+                expected_iv_len = 12
+            else:
+                iv = result[4:]
+                expected_iv_len = 16
+            if len(iv) != expected_iv_len:
+                _LOGGER.error(
+                    "%s: Invalid IV length %d for mode %s (expected %d)",
+                    self.name,
+                    len(iv),
+                    self._encryption_mode.name,
+                    expected_iv_len,
+                )
+                return False
+            self._iv = iv
+            self._cipher = None  # Reset cipher when IV changes
+            _LOGGER.debug("%s: Encryption initialized successfully", self.name)
+
+        return ok
+
+    async def _execute_disconnect(self) -> None:
+        """
+        Reset encryption state and disconnect.
+
+        Clears IV, cipher, and encryption mode so they can be
+        re-detected on the next connection (e.g., after firmware update).
+        """
+        async with self._connect_lock:
+            self._iv = None
+            self._cipher = None
+            self._encryption_mode = None
+            await self._execute_disconnect_with_lock()
+
+    def _get_cipher(self) -> Cipher:
+        if self._cipher is None:
+            if self._iv is None:
+                raise RuntimeError("Cannot create cipher: IV is None")
+            if self._encryption_mode == AESMode.GCM:
+                self._cipher = Cipher(
+                    algorithms.AES128(self._encryption_key), modes.GCM(self._iv)
+                )
+            else:
+                self._cipher = Cipher(
+                    algorithms.AES128(self._encryption_key), modes.CTR(self._iv)
+                )
+        return self._cipher
+
+    def _encrypt(self, data: str) -> tuple[str, str]:
+        if len(data) == 0:
+            return "", ""
+        if self._iv is None:
+            raise RuntimeError("Cannot encrypt: IV is None")
+        encryptor = self._get_cipher().encryptor()
+        ciphertext = encryptor.update(bytearray.fromhex(data)) + encryptor.finalize()
+        if self._encryption_mode == AESMode.GCM:
+            header_hex = encryptor.tag[:2].hex()
+            # GCM cipher is single-use; clear it so _get_cipher() creates a fresh one
+            self._cipher = None
+        else:
+            header_hex = self._iv[0:2].hex()
+        return ciphertext.hex(), header_hex
+
+    def _decrypt(self, data: bytearray) -> bytes:
+        if len(data) == 0:
+            return b""
+        if self._iv is None:
+            if self._expected_disconnect:
+                _LOGGER.debug(
+                    "%s: Cannot decrypt, IV is None during expected disconnect",
+                    self.name,
+                )
+                return b""
+            raise RuntimeError("Cannot decrypt: IV is None")
+        if self._encryption_mode == AESMode.GCM:
+            # Firmware only returns a 2-byte partial tag which can't be used for
+            # verification. Use a dummy 16-byte tag and skip finalize() since
+            # authentication is handled by the firmware.
+            decryptor = Cipher(
+                algorithms.AES128(self._encryption_key),
+                modes.GCM(self._iv, b"\x00" * 16),
+            ).decryptor()
+            return decryptor.update(data)
+        decryptor = self._get_cipher().decryptor()
+        return decryptor.update(data) + decryptor.finalize()
+
+    def _increment_gcm_iv(self) -> None:
+        """Increment GCM IV by 1 (big-endian). Called after each encrypted command."""
+        if self._iv is None:
+            raise RuntimeError("Cannot increment GCM IV: IV is None")
+        if len(self._iv) != 12:
+            raise RuntimeError("Cannot increment GCM IV: IV length is not 12 bytes")
+        iv_int = int.from_bytes(self._iv, "big") + 1
+        self._iv = iv_int.to_bytes(12, "big")
+        self._cipher = None
+
+    def _resolve_encryption_mode(self, mode_byte: int | None) -> None:
+        """Resolve encryption mode from device response when available."""
+        if mode_byte is None:
+            raise ValueError("Encryption mode byte is missing")
+        detected_mode = _normalize_encryption_mode(mode_byte)
+        if self._encryption_mode is not None and self._encryption_mode != detected_mode:
+            raise ValueError(
+                f"Conflicting encryption modes detected: {self._encryption_mode.name} vs {detected_mode.name}"
+            )
+        self._encryption_mode = detected_mode
+        _LOGGER.debug("%s: Detected encryption mode: %s", self.name, detected_mode.name)
+
+
+class SwitchbotDeviceOverrideStateDuringConnection(SwitchbotBaseDevice):
+    """
+    Base Representation of a Switchbot Device.
+
+    This base class ignores the advertisement data during connection and uses the
+    data from the device instead.
+    """
+
+    def update_from_advertisement(self, advertisement: SwitchBotAdvertisement) -> None:
+        super().update_from_advertisement(advertisement)
+        if self._client and self._client.is_connected:
+            # We do not consume the advertisement data if we are connected
+            # to the device. This is because the advertisement data is not
+            # updated when the device is connected for some devices.
+            _LOGGER.debug("%s: Ignore advertisement data during connection", self.name)
+            return
+        self._set_advertisement_data(advertisement)
+
+
+class SwitchbotSequenceDevice(SwitchbotDevice):
+    """
+    A Switchbot sequence device.
+
+    This class must not use SwitchbotDeviceOverrideStateDuringConnection because
+    it needs to know when the sequence_number has changed.
+    """
+
+    def update_from_advertisement(self, advertisement: SwitchBotAdvertisement) -> None:
+        """Update device data from advertisement."""
+        current_state = self._get_adv_value("sequence_number")
+        super().update_from_advertisement(advertisement)
+        new_state = self._get_adv_value("sequence_number")
+        _LOGGER.debug(
+            "%s: update advertisement: %s (seq before: %s) (seq after: %s)",
+            self.name,
+            advertisement,
+            current_state,
+            new_state,
+        )
+        if current_state != new_state:
+            create_background_task(self.update())
+
+
+async def fetch_cloud_devices(
+    session: aiohttp.ClientSession,
+    username: str,
+    password: str,
+) -> dict[str, SwitchbotModel]:
+    """Fetch devices from SwitchBot API and return MAC to model mapping."""
+    # Get devices from the API (which also populates the cache)
+    return await SwitchbotBaseDevice.get_devices(session, username, password)

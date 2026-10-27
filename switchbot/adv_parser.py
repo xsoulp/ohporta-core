@@ -1,0 +1,1106 @@
+"""Library to handle connection with Switchbot."""
+
+from __future__ import annotations
+
+import logging
+from collections import defaultdict
+from collections.abc import Callable
+from functools import lru_cache
+from typing import Any, TypedDict
+
+from bleak.backends.device import BLEDevice
+from bleak.backends.scanner import AdvertisementData
+
+from .adv_parsers.air_purifier import process_air_purifier
+from .adv_parsers.art_frame import process_art_frame
+from .adv_parsers.blind_tilt import process_woblindtilt
+from .adv_parsers.bot import process_wohand
+from .adv_parsers.bulb import process_color_bulb
+from .adv_parsers.ceiling_light import process_woceiling
+from .adv_parsers.climate_panel import process_climate_panel
+from .adv_parsers.contact import process_wocontact
+from .adv_parsers.curtain import process_wocurtain
+from .adv_parsers.fan import (
+    process_circulator_fan_pro,
+    process_fan,
+    process_standing_fan,
+)
+from .adv_parsers.hub2 import process_wohub2
+from .adv_parsers.hub3 import process_hub3
+from .adv_parsers.hubmini_matter import process_hubmini_matter
+from .adv_parsers.humidifier import process_evaporative_humidifier, process_wohumidifier
+from .adv_parsers.keypad import process_wokeypad
+from .adv_parsers.keypad_vision import process_keypad_vision, process_keypad_vision_pro
+from .adv_parsers.leak import process_leak
+from .adv_parsers.light_strip import (
+    process_candle_warmer_lamp,
+    process_light,
+    process_rgbic_light,
+    process_rgbicww_ceiling_light,
+    process_wostrip,
+)
+from .adv_parsers.lock import (
+    process_lock2,
+    process_locklite,
+    process_wolock,
+    process_wolock_pro,
+)
+from .adv_parsers.meter import process_wosensorth, process_wosensorth_c
+from .adv_parsers.motion import process_wopresence
+from .adv_parsers.plug import process_woplugmini
+from .adv_parsers.presence_sensor import process_presence_sensor
+from .adv_parsers.relay_switch import (
+    process_garage_door_opener,
+    process_relay_switch_1pm,
+    process_relay_switch_2pm,
+    process_relay_switch_common_data,
+)
+from .adv_parsers.remote import process_woremote, process_wouniversal_remote
+from .adv_parsers.roller_shade import process_worollershade
+from .adv_parsers.smart_thermostat_radiator import process_smart_thermostat_radiator
+from .adv_parsers.vacuum import process_vacuum, process_vacuum_k
+from .adv_parsers.weather_station import process_weather_station
+from .const import SwitchbotModel
+from .models import SwitchBotAdvertisement
+from .utils import format_mac_upper
+
+_LOGGER = logging.getLogger(__name__)
+
+SERVICE_DATA_ORDER = (
+    "0000fd3d-0000-1000-8000-00805f9b34fb",
+    "00000d00-0000-1000-8000-00805f9b34fb",
+)
+MFR_DATA_ORDER = (2409, 741, 89)
+
+_MODEL_TO_MAC_CACHE: dict[str, SwitchbotModel] = {}
+
+
+class SwitchbotSupportedType(TypedDict):
+    """Supported type of Switchbot."""
+
+    modelName: SwitchbotModel
+    modelFriendlyName: str
+    func: Callable[[bytes | None, bytes | None], dict[str, bool | int | str | None]]
+    manufacturer_id: int | None
+    manufacturer_data_length: int | None
+
+
+SUPPORTED_TYPES: dict[str | bytes, SwitchbotSupportedType] = {
+    "d": {
+        "modelName": SwitchbotModel.CONTACT_SENSOR,
+        "modelFriendlyName": "Contact Sensor",
+        "func": process_wocontact,
+        "manufacturer_id": 2409,
+    },
+    "D": {
+        "modelName": SwitchbotModel.CONTACT_SENSOR,
+        "modelFriendlyName": "Contact Sensor",
+        "func": process_wocontact,
+        "manufacturer_id": 2409,
+    },
+    "H": {
+        "modelName": SwitchbotModel.BOT,
+        "modelFriendlyName": "Bot",
+        "func": process_wohand,
+        "manufacturer_id": 89,
+    },
+    "s": {
+        "modelName": SwitchbotModel.MOTION_SENSOR,
+        "modelFriendlyName": "Motion Sensor",
+        "func": process_wopresence,
+        "manufacturer_id": 2409,
+    },
+    "S": {
+        "modelName": SwitchbotModel.MOTION_SENSOR,
+        "modelFriendlyName": "Motion Sensor",
+        "func": process_wopresence,
+        "manufacturer_id": 2409,
+    },
+    "r": {
+        "modelName": SwitchbotModel.LIGHT_STRIP,
+        "modelFriendlyName": "Light Strip",
+        "func": process_wostrip,
+        "manufacturer_id": 2409,
+    },
+    "R": {
+        "modelName": SwitchbotModel.LIGHT_STRIP,
+        "modelFriendlyName": "Light Strip",
+        "func": process_wostrip,
+        "manufacturer_id": 2409,
+    },
+    "{": {
+        "modelName": SwitchbotModel.CURTAIN,
+        "modelFriendlyName": "Curtain 3",
+        "func": process_wocurtain,
+        "manufacturer_id": 2409,
+    },
+    "[": {
+        "modelName": SwitchbotModel.CURTAIN,
+        "modelFriendlyName": "Curtain 3",
+        "func": process_wocurtain,
+        "manufacturer_id": 2409,
+    },
+    "c": {
+        "modelName": SwitchbotModel.CURTAIN,
+        "modelFriendlyName": "Curtain",
+        "func": process_wocurtain,
+        "manufacturer_id": 2409,
+    },
+    "C": {
+        "modelName": SwitchbotModel.CURTAIN,
+        "modelFriendlyName": "Curtain",
+        "func": process_wocurtain,
+        "manufacturer_id": 2409,
+    },
+    "w": {
+        "modelName": SwitchbotModel.IO_METER,
+        "modelFriendlyName": "Indoor/Outdoor Meter",
+        "func": process_wosensorth,
+        "manufacturer_id": 2409,
+    },
+    "W": {
+        "modelName": SwitchbotModel.IO_METER,
+        "modelFriendlyName": "Indoor/Outdoor Meter",
+        "func": process_wosensorth,
+        "manufacturer_id": 2409,
+    },
+    "i": {
+        "modelName": SwitchbotModel.METER,
+        "modelFriendlyName": "Meter Plus",
+        "func": process_wosensorth,
+        "manufacturer_id": 2409,
+    },
+    "I": {
+        "modelName": SwitchbotModel.METER,
+        "modelFriendlyName": "Meter Plus",
+        "func": process_wosensorth,
+        "manufacturer_id": 2409,
+    },
+    "T": {
+        "modelName": SwitchbotModel.METER,
+        "modelFriendlyName": "Meter",
+        "func": process_wosensorth,
+        "manufacturer_id": 2409,
+    },
+    "t": {
+        "modelName": SwitchbotModel.METER,
+        "modelFriendlyName": "Meter",
+        "func": process_wosensorth,
+        "manufacturer_id": 2409,
+    },
+    "4": {
+        "modelName": SwitchbotModel.METER_PRO,
+        "modelFriendlyName": "Meter Pro",
+        "func": process_wosensorth,
+        "manufacturer_id": 2409,
+    },
+    b"\x14": {
+        "modelName": SwitchbotModel.METER_PRO,
+        "modelFriendlyName": "Meter Pro",
+        "func": process_wosensorth,
+        "manufacturer_id": 2409,
+    },
+    "5": {
+        "modelName": SwitchbotModel.METER_PRO_C,
+        "modelFriendlyName": "Meter Pro CO2",
+        "func": process_wosensorth_c,
+        "manufacturer_id": 2409,
+    },
+    b"\x15": {
+        "modelName": SwitchbotModel.METER_PRO_C,
+        "modelFriendlyName": "Meter Pro CO2",
+        "func": process_wosensorth_c,
+        "manufacturer_id": 2409,
+    },
+    "v": {
+        "modelName": SwitchbotModel.HUB2,
+        "modelFriendlyName": "Hub 2",
+        "func": process_wohub2,
+        "manufacturer_id": 2409,
+    },
+    "V": {
+        "modelName": SwitchbotModel.HUB2,
+        "modelFriendlyName": "Hub 2",
+        "func": process_wohub2,
+        "manufacturer_id": 2409,
+    },
+    "g": {
+        "modelName": SwitchbotModel.PLUG_MINI,
+        "modelFriendlyName": "Plug Mini",
+        "func": process_woplugmini,
+        "manufacturer_id": 2409,
+    },
+    "G": {
+        "modelName": SwitchbotModel.PLUG_MINI,
+        "modelFriendlyName": "Plug Mini",
+        "func": process_woplugmini,
+        "manufacturer_id": 2409,
+    },
+    "j": {
+        "modelName": SwitchbotModel.PLUG_MINI,
+        "modelFriendlyName": "Plug Mini (JP)",
+        "func": process_woplugmini,
+        "manufacturer_id": 2409,
+    },
+    "J": {
+        "modelName": SwitchbotModel.PLUG_MINI,
+        "modelFriendlyName": "Plug Mini (JP)",
+        "func": process_woplugmini,
+        "manufacturer_id": 2409,
+    },
+    "u": {
+        "modelName": SwitchbotModel.COLOR_BULB,
+        "modelFriendlyName": "Color Bulb",
+        "func": process_color_bulb,
+        "manufacturer_id": 2409,
+    },
+    "U": {
+        "modelName": SwitchbotModel.COLOR_BULB,
+        "modelFriendlyName": "Color Bulb",
+        "func": process_color_bulb,
+        "manufacturer_id": 2409,
+    },
+    "q": {
+        "modelName": SwitchbotModel.CEILING_LIGHT,
+        "modelFriendlyName": "Ceiling Light",
+        "func": process_woceiling,
+        "manufacturer_id": 2409,
+    },
+    "Q": {
+        "modelName": SwitchbotModel.CEILING_LIGHT,
+        "modelFriendlyName": "Ceiling Light",
+        "func": process_woceiling,
+        "manufacturer_id": 2409,
+    },
+    "n": {
+        "modelName": SwitchbotModel.CEILING_LIGHT,
+        "modelFriendlyName": "Ceiling Light Pro",
+        "func": process_woceiling,
+        "manufacturer_id": 2409,
+    },
+    "N": {
+        "modelName": SwitchbotModel.CEILING_LIGHT,
+        "modelFriendlyName": "Ceiling Light Pro",
+        "func": process_woceiling,
+        "manufacturer_id": 2409,
+    },
+    "e": {
+        "modelName": SwitchbotModel.HUMIDIFIER,
+        "modelFriendlyName": "Humidifier",
+        "func": process_wohumidifier,
+        "manufacturer_id": 741,
+        "manufacturer_data_length": 6,
+    },
+    "E": {
+        "modelName": SwitchbotModel.HUMIDIFIER,
+        "modelFriendlyName": "Humidifier",
+        "func": process_wohumidifier,
+        "manufacturer_id": 741,
+        "manufacturer_data_length": 6,
+    },
+    "#": {
+        "modelName": SwitchbotModel.EVAPORATIVE_HUMIDIFIER,
+        "modelFriendlyName": "Evaporative Humidifier",
+        "func": process_evaporative_humidifier,
+        "manufacturer_id": 2409,
+    },
+    b"\x03": {
+        "modelName": SwitchbotModel.EVAPORATIVE_HUMIDIFIER,
+        "modelFriendlyName": "Evaporative Humidifier",
+        "func": process_evaporative_humidifier,
+        "manufacturer_id": 2409,
+    },
+    "o": {
+        "modelName": SwitchbotModel.LOCK,
+        "modelFriendlyName": "Lock",
+        "func": process_wolock,
+        "manufacturer_id": 2409,
+    },
+    "O": {
+        "modelName": SwitchbotModel.LOCK,
+        "modelFriendlyName": "Lock",
+        "func": process_wolock,
+        "manufacturer_id": 2409,
+    },
+    "$": {
+        "modelName": SwitchbotModel.LOCK_PRO,
+        "modelFriendlyName": "Lock Pro",
+        "func": process_wolock_pro,
+        "manufacturer_id": 2409,
+    },
+    b"\x04": {
+        "modelName": SwitchbotModel.LOCK_PRO,
+        "modelFriendlyName": "Lock Pro",
+        "func": process_wolock_pro,
+        "manufacturer_id": 2409,
+    },
+    "x": {
+        "modelName": SwitchbotModel.BLIND_TILT,
+        "modelFriendlyName": "Blind Tilt",
+        "func": process_woblindtilt,
+        "manufacturer_id": 2409,
+    },
+    "X": {
+        "modelName": SwitchbotModel.BLIND_TILT,
+        "modelFriendlyName": "Blind Tilt",
+        "func": process_woblindtilt,
+        "manufacturer_id": 2409,
+    },
+    "&": {
+        "modelName": SwitchbotModel.LEAK,
+        "modelFriendlyName": "Leak Detector",
+        "func": process_leak,
+        "manufacturer_id": 2409,
+    },
+    b"\x06": {
+        "modelName": SwitchbotModel.LEAK,
+        "modelFriendlyName": "Leak Detector",
+        "func": process_leak,
+        "manufacturer_id": 2409,
+    },
+    "y": {
+        "modelName": SwitchbotModel.KEYPAD,
+        "modelFriendlyName": "Keypad",
+        "func": process_wokeypad,
+        "manufacturer_id": 2409,
+    },
+    "Y": {
+        "modelName": SwitchbotModel.KEYPAD,
+        "modelFriendlyName": "Keypad",
+        "func": process_wokeypad,
+        "manufacturer_id": 2409,
+    },
+    "<": {
+        "modelName": SwitchbotModel.RELAY_SWITCH_1PM,
+        "modelFriendlyName": "Relay Switch 1PM",
+        "func": process_relay_switch_1pm,
+        "manufacturer_id": 2409,
+    },
+    b"\x1c": {
+        "modelName": SwitchbotModel.RELAY_SWITCH_1PM,
+        "modelFriendlyName": "Relay Switch 1PM",
+        "func": process_relay_switch_1pm,
+        "manufacturer_id": 2409,
+    },
+    ";": {
+        "modelName": SwitchbotModel.RELAY_SWITCH_1,
+        "modelFriendlyName": "Relay Switch 1",
+        "func": process_relay_switch_common_data,
+        "manufacturer_id": 2409,
+    },
+    b"\x1b": {
+        "modelName": SwitchbotModel.RELAY_SWITCH_1,
+        "modelFriendlyName": "Relay Switch 1",
+        "func": process_relay_switch_common_data,
+        "manufacturer_id": 2409,
+    },
+    "b": {
+        "modelName": SwitchbotModel.REMOTE,
+        "modelFriendlyName": "Remote",
+        "func": process_woremote,
+        "manufacturer_id": 89,
+    },
+    "B": {
+        "modelName": SwitchbotModel.REMOTE,
+        "modelFriendlyName": "Remote",
+        "func": process_woremote,
+        "manufacturer_id": 89,
+    },
+    "\x07": {
+        "modelName": SwitchbotModel.UNIVERSAL_REMOTE,
+        "modelFriendlyName": "Universal Remote",
+        "func": process_wouniversal_remote,
+        "manufacturer_id": 2409,
+    },
+    "'": {
+        "modelName": SwitchbotModel.UNIVERSAL_REMOTE,
+        "modelFriendlyName": "Universal Remote",
+        "func": process_wouniversal_remote,
+        "manufacturer_id": 2409,
+    },
+    ",": {
+        "modelName": SwitchbotModel.ROLLER_SHADE,
+        "modelFriendlyName": "Roller Shade",
+        "func": process_worollershade,
+        "manufacturer_id": 2409,
+    },
+    b"\x0c": {
+        "modelName": SwitchbotModel.ROLLER_SHADE,
+        "modelFriendlyName": "Roller Shade",
+        "func": process_worollershade,
+        "manufacturer_id": 2409,
+    },
+    "%": {
+        "modelName": SwitchbotModel.HUBMINI_MATTER,
+        "modelFriendlyName": "HubMini Matter",
+        "func": process_hubmini_matter,
+        "manufacturer_id": 2409,
+    },
+    b"\x05": {
+        "modelName": SwitchbotModel.HUBMINI_MATTER,
+        "modelFriendlyName": "HubMini Matter",
+        "func": process_hubmini_matter,
+        "manufacturer_id": 2409,
+    },
+    "~": {
+        "modelName": SwitchbotModel.CIRCULATOR_FAN,
+        "modelFriendlyName": "Circulator Fan",
+        "func": process_fan,
+        "manufacturer_id": 2409,
+    },
+    "^": {
+        "modelName": SwitchbotModel.CIRCULATOR_FAN,
+        "modelFriendlyName": "Circulator Fan",
+        "func": process_fan,
+        "manufacturer_id": 2409,
+    },
+    ".": {
+        "modelName": SwitchbotModel.K20_VACUUM,
+        "modelFriendlyName": "K20 Vacuum",
+        "func": process_vacuum,
+        "manufacturer_id": 2409,
+    },
+    b"\x0f": {
+        "modelName": SwitchbotModel.K20_VACUUM,
+        "modelFriendlyName": "K20 Vacuum",
+        "func": process_vacuum,
+        "manufacturer_id": 2409,
+    },
+    "z": {
+        "modelName": SwitchbotModel.S10_VACUUM,
+        "modelFriendlyName": "S10 Vacuum",
+        "func": process_vacuum,
+        "manufacturer_id": 2409,
+    },
+    "Z": {
+        "modelName": SwitchbotModel.S10_VACUUM,
+        "modelFriendlyName": "S10 Vacuum",
+        "func": process_vacuum,
+        "manufacturer_id": 2409,
+    },
+    "3": {
+        "modelName": SwitchbotModel.K10_PRO_COMBO_VACUUM,
+        "modelFriendlyName": "K10+ Pro Combo Vacuum",
+        "func": process_vacuum,
+        "manufacturer_id": 2409,
+    },
+    b"\x13": {
+        "modelName": SwitchbotModel.K10_PRO_COMBO_VACUUM,
+        "modelFriendlyName": "K10+ Pro Combo Vacuum",
+        "func": process_vacuum,
+        "manufacturer_id": 2409,
+    },
+    "}": {
+        "modelName": SwitchbotModel.K10_VACUUM,
+        "modelFriendlyName": "K10+ Vacuum",
+        "func": process_vacuum_k,
+        "manufacturer_id": 2409,
+    },
+    "]": {
+        "modelName": SwitchbotModel.K10_VACUUM,
+        "modelFriendlyName": "K10+ Vacuum",
+        "func": process_vacuum_k,
+        "manufacturer_id": 2409,
+    },
+    "(": {
+        "modelName": SwitchbotModel.K10_PRO_VACUUM,
+        "modelFriendlyName": "K10+ Pro Vacuum",
+        "func": process_vacuum_k,
+        "manufacturer_id": 2409,
+    },
+    b"\x08": {
+        "modelName": SwitchbotModel.K10_PRO_VACUUM,
+        "modelFriendlyName": "K10+ Pro Vacuum",
+        "func": process_vacuum_k,
+        "manufacturer_id": 2409,
+    },
+    "*": {
+        "modelName": SwitchbotModel.AIR_PURIFIER_US,
+        "modelFriendlyName": "Air Purifier US",
+        "func": process_air_purifier,
+        "manufacturer_id": 2409,
+    },
+    b"\x0a": {
+        "modelName": SwitchbotModel.AIR_PURIFIER_US,
+        "modelFriendlyName": "Air Purifier US",
+        "func": process_air_purifier,
+        "manufacturer_id": 2409,
+    },
+    "+": {
+        "modelName": SwitchbotModel.AIR_PURIFIER_JP,
+        "modelFriendlyName": "Air Purifier JP",
+        "func": process_air_purifier,
+        "manufacturer_id": 2409,
+    },
+    b"\x0b": {
+        "modelName": SwitchbotModel.AIR_PURIFIER_JP,
+        "modelFriendlyName": "Air Purifier JP",
+        "func": process_air_purifier,
+        "manufacturer_id": 2409,
+    },
+    "7": {
+        "modelName": SwitchbotModel.AIR_PURIFIER_TABLE_US,
+        "modelFriendlyName": "Air Purifier Table US",
+        "func": process_air_purifier,
+        "manufacturer_id": 2409,
+    },
+    b"\x17": {
+        "modelName": SwitchbotModel.AIR_PURIFIER_TABLE_US,
+        "modelFriendlyName": "Air Purifier Table US",
+        "func": process_air_purifier,
+        "manufacturer_id": 2409,
+    },
+    "8": {
+        "modelName": SwitchbotModel.AIR_PURIFIER_TABLE_JP,
+        "modelFriendlyName": "Air Purifier Table JP",
+        "func": process_air_purifier,
+        "manufacturer_id": 2409,
+    },
+    b"\x18": {
+        "modelName": SwitchbotModel.AIR_PURIFIER_TABLE_JP,
+        "modelFriendlyName": "Air Purifier Table JP",
+        "func": process_air_purifier,
+        "manufacturer_id": 2409,
+    },
+    b"\x00\x10\xb9\x40": {
+        "modelName": SwitchbotModel.HUB3,
+        "modelFriendlyName": "Hub3",
+        "func": process_hub3,
+        "manufacturer_id": 2409,
+    },
+    b"\x01\x10\xb9\x40": {
+        "modelName": SwitchbotModel.HUB3,
+        "modelFriendlyName": "Hub3",
+        "func": process_hub3,
+        "manufacturer_id": 2409,
+    },
+    "-": {
+        "modelName": SwitchbotModel.LOCK_LITE,
+        "modelFriendlyName": "Lock Lite",
+        "func": process_locklite,
+        "manufacturer_id": 2409,
+    },
+    b"\x0d": {
+        "modelName": SwitchbotModel.LOCK_LITE,
+        "modelFriendlyName": "Lock Lite",
+        "func": process_locklite,
+        "manufacturer_id": 2409,
+    },
+    b"\x00\x10\xa5\xb8": {
+        "modelName": SwitchbotModel.LOCK_ULTRA,
+        "modelFriendlyName": "Lock Ultra",
+        "func": process_lock2,
+        "manufacturer_id": 2409,
+    },
+    b"\x01\x10\xa5\xb8": {
+        "modelName": SwitchbotModel.LOCK_ULTRA,
+        "modelFriendlyName": "Lock Ultra",
+        "func": process_lock2,
+        "manufacturer_id": 2409,
+    },
+    ">": {
+        "modelName": SwitchbotModel.GARAGE_DOOR_OPENER,
+        "modelFriendlyName": "Garage Door Opener",
+        "func": process_garage_door_opener,
+        "manufacturer_id": 2409,
+    },
+    b"\x1e": {
+        "modelName": SwitchbotModel.GARAGE_DOOR_OPENER,
+        "modelFriendlyName": "Garage Door Opener",
+        "func": process_garage_door_opener,
+        "manufacturer_id": 2409,
+    },
+    "=": {
+        "modelName": SwitchbotModel.RELAY_SWITCH_2PM,
+        "modelFriendlyName": "Relay Switch 2PM",
+        "func": process_relay_switch_2pm,
+        "manufacturer_id": 2409,
+    },
+    b"\x1d": {
+        "modelName": SwitchbotModel.RELAY_SWITCH_2PM,
+        "modelFriendlyName": "Relay Switch 2PM",
+        "func": process_relay_switch_2pm,
+        "manufacturer_id": 2409,
+    },
+    b"\x00\x10\xd0\xb0": {
+        "modelName": SwitchbotModel.FLOOR_LAMP,
+        "modelFriendlyName": "Floor Lamp",
+        "func": process_light,
+        "manufacturer_id": 2409,
+    },
+    b"\x01\x10\xd0\xb0": {
+        "modelName": SwitchbotModel.FLOOR_LAMP,
+        "modelFriendlyName": "Floor Lamp",
+        "func": process_light,
+        "manufacturer_id": 2409,
+    },
+    b"\x00\x11\x22\xb8": {
+        "modelName": SwitchbotModel.CANDLE_WARMER_LAMP,
+        "modelFriendlyName": "Candle Warmer Lamp",
+        "func": process_candle_warmer_lamp,
+        "manufacturer_id": 2409,
+    },
+    b"\x01\x11\x22\xb8": {
+        "modelName": SwitchbotModel.CANDLE_WARMER_LAMP,
+        "modelFriendlyName": "Candle Warmer Lamp",
+        "func": process_candle_warmer_lamp,
+        "manufacturer_id": 2409,
+    },
+    b"\x00\x10\xd0\xb1": {
+        "modelName": SwitchbotModel.STRIP_LIGHT_3,
+        "modelFriendlyName": "Strip Light 3",
+        "func": process_light,
+        "manufacturer_id": 2409,
+    },
+    b"\x01\x10\xd0\xb1": {
+        "modelName": SwitchbotModel.STRIP_LIGHT_3,
+        "modelFriendlyName": "Strip Light 3",
+        "func": process_light,
+        "manufacturer_id": 2409,
+    },
+    "?": {
+        "modelName": SwitchbotModel.PLUG_MINI_EU,
+        "modelFriendlyName": "Plug Mini (EU)",
+        "func": process_relay_switch_1pm,
+        "manufacturer_id": 2409,
+    },
+    b"\x1f": {
+        "modelName": SwitchbotModel.PLUG_MINI_EU,
+        "modelFriendlyName": "Plug Mini (EU)",
+        "func": process_relay_switch_1pm,
+        "manufacturer_id": 2409,
+    },
+    b"\x00\x10\xd0\xb3": {
+        "modelName": SwitchbotModel.RGBICWW_STRIP_LIGHT,
+        "modelFriendlyName": "RGBICWW Strip Light",
+        "func": process_rgbic_light,
+        "manufacturer_id": 2409,
+    },
+    b"\x01\x10\xd0\xb3": {
+        "modelName": SwitchbotModel.RGBICWW_STRIP_LIGHT,
+        "modelFriendlyName": "RGBICWW Strip Light",
+        "func": process_rgbic_light,
+        "manufacturer_id": 2409,
+    },
+    b"\x00\x10\xd0\xb4": {
+        "modelName": SwitchbotModel.RGBICWW_FLOOR_LAMP,
+        "modelFriendlyName": "RGBICWW Floor Lamp",
+        "func": process_rgbic_light,
+        "manufacturer_id": 2409,
+    },
+    b"\x01\x10\xd0\xb4": {
+        "modelName": SwitchbotModel.RGBICWW_FLOOR_LAMP,
+        "modelFriendlyName": "RGBICWW Floor Lamp",
+        "func": process_rgbic_light,
+        "manufacturer_id": 2409,
+    },
+    b"\x00\x11\xbe\xf8": {
+        "modelName": SwitchbotModel.RGBICWW_LIGHT_BARS,
+        "modelFriendlyName": "RGBICWW Light Bars",
+        "func": process_rgbic_light,
+        "manufacturer_id": 2409,
+    },
+    b"\x01\x11\xbe\xf8": {
+        "modelName": SwitchbotModel.RGBICWW_LIGHT_BARS,
+        "modelFriendlyName": "RGBICWW Light Bars",
+        "func": process_rgbic_light,
+        "manufacturer_id": 2409,
+    },
+    b"\x00\x11\xbb\x10": {
+        "modelName": SwitchbotModel.RGBICWW_CEILING_LIGHT,
+        "modelFriendlyName": "RGBICWW Ceiling Light",
+        "func": process_rgbicww_ceiling_light,
+        "manufacturer_id": 2409,
+    },
+    b"\x01\x11\xbb\x10": {
+        "modelName": SwitchbotModel.RGBICWW_CEILING_LIGHT,
+        "modelFriendlyName": "RGBICWW Ceiling Light",
+        "func": process_rgbicww_ceiling_light,
+        "manufacturer_id": 2409,
+    },
+    b"\x00\x11\xb3@": {
+        "modelName": SwitchbotModel.CIRCULATOR_FAN_PRO,
+        "modelFriendlyName": "Circulator Fan Pro",
+        "func": process_circulator_fan_pro,
+        "manufacturer_id": 2409,
+    },
+    b"\x01\x11\xb3@": {
+        "modelName": SwitchbotModel.CIRCULATOR_FAN_PRO,
+        "modelFriendlyName": "Circulator Fan Pro",
+        "func": process_circulator_fan_pro,
+        "manufacturer_id": 2409,
+    },
+    b"\x00\x10\xd0\xb7": {
+        "modelName": SwitchbotModel.PERMANENT_OUTDOOR_LIGHT,
+        "modelFriendlyName": "Permanent Outdoor Light",
+        "func": process_rgbic_light,
+        "manufacturer_id": 2409,
+    },
+    b"\x01\x10\xd0\xb7": {
+        "modelName": SwitchbotModel.PERMANENT_OUTDOOR_LIGHT,
+        "modelFriendlyName": "Permanent Outdoor Light",
+        "func": process_rgbic_light,
+        "manufacturer_id": 2409,
+    },
+    b"\x00\x10\xd0\xb5": {
+        "modelName": SwitchbotModel.RGBIC_NEON_WIRE_ROPE_LIGHT,
+        "modelFriendlyName": "RGBIC Neon Wire Rope Light",
+        "func": process_wostrip,
+        "manufacturer_id": 2409,
+    },
+    b"\x00\x10\xd0\xb6": {
+        "modelName": SwitchbotModel.RGBIC_NEON_ROPE_LIGHT,
+        "modelFriendlyName": "RGBIC Neon Rope Light",
+        "func": process_wostrip,
+        "manufacturer_id": 2409,
+    },
+    b"\x01\x10\xd0\xb5": {
+        "modelName": SwitchbotModel.RGBIC_NEON_WIRE_ROPE_LIGHT,
+        "modelFriendlyName": "RGBIC Neon Wire Rope Light",
+        "func": process_wostrip,
+        "manufacturer_id": 2409,
+    },
+    b"\x01\x10\xd0\xb6": {
+        "modelName": SwitchbotModel.RGBIC_NEON_ROPE_LIGHT,
+        "modelFriendlyName": "RGBIC Neon Rope Light",
+        "func": process_wostrip,
+        "manufacturer_id": 2409,
+    },
+    b"\x00\x10\xfb\xa8": {
+        "modelName": SwitchbotModel.K11_VACUUM,
+        "modelFriendlyName": "K11+ Vacuum",
+        "func": process_vacuum,
+        "manufacturer_id": 2409,
+    },
+    b"\x01\x10\xfb\xa8": {
+        "modelName": SwitchbotModel.K11_VACUUM,
+        "modelFriendlyName": "K11+ Vacuum",
+        "func": process_vacuum,
+        "manufacturer_id": 2409,
+    },
+    b"\x00\x10\xf3\xd8": {
+        "modelName": SwitchbotModel.CLIMATE_PANEL,
+        "modelFriendlyName": "Climate Panel",
+        "func": process_climate_panel,
+        "manufacturer_id": 2409,
+    },
+    b"\x01\x10\xf3\xd8": {
+        "modelName": SwitchbotModel.CLIMATE_PANEL,
+        "modelFriendlyName": "Climate Panel",
+        "func": process_climate_panel,
+        "manufacturer_id": 2409,
+    },
+    b"\x00\x116@": {
+        "modelName": SwitchbotModel.SMART_THERMOSTAT_RADIATOR,
+        "modelFriendlyName": "Smart Thermostat Radiator",
+        "func": process_smart_thermostat_radiator,
+        "manufacturer_id": 2409,
+    },
+    b"\x01\x116@": {
+        "modelName": SwitchbotModel.SMART_THERMOSTAT_RADIATOR,
+        "modelFriendlyName": "Smart Thermostat Radiator",
+        "func": process_smart_thermostat_radiator,
+        "manufacturer_id": 2409,
+    },
+    b"\x00\x10\xe0P": {
+        "modelName": SwitchbotModel.S20_VACUUM,
+        "modelFriendlyName": "S20 Vacuum",
+        "func": process_vacuum,
+        "manufacturer_id": 2409,
+    },
+    b"\x01\x10\xe0P": {
+        "modelName": SwitchbotModel.S20_VACUUM,
+        "modelFriendlyName": "S20 Vacuum",
+        "func": process_vacuum,
+        "manufacturer_id": 2409,
+    },
+    b"\x00\x10\xcc\xc8": {
+        "modelName": SwitchbotModel.PRESENCE_SENSOR,
+        "modelFriendlyName": "Presence Sensor",
+        "func": process_presence_sensor,
+        "manufacturer_id": 2409,
+    },
+    b"\x01\x10\xcc\xc8": {
+        "modelName": SwitchbotModel.PRESENCE_SENSOR,
+        "modelFriendlyName": "Presence Sensor",
+        "func": process_presence_sensor,
+        "manufacturer_id": 2409,
+    },
+    b"\x00\x11>\x10": {
+        "modelName": SwitchbotModel.ART_FRAME,
+        "modelFriendlyName": "Art Frame",
+        "func": process_art_frame,
+        "manufacturer_id": 2409,
+    },
+    b"\x01\x11>\x10": {
+        "modelName": SwitchbotModel.ART_FRAME,
+        "modelFriendlyName": "Art Frame",
+        "func": process_art_frame,
+        "manufacturer_id": 2409,
+    },
+    b"\x00\x11\x03x": {
+        "modelName": SwitchbotModel.KEYPAD_VISION,
+        "modelFriendlyName": "Keypad Vision",
+        "func": process_keypad_vision,
+        "manufacturer_id": 2409,
+    },
+    b"\x01\x11\x03x": {
+        "modelName": SwitchbotModel.KEYPAD_VISION,
+        "modelFriendlyName": "Keypad Vision",
+        "func": process_keypad_vision,
+        "manufacturer_id": 2409,
+    },
+    b"\x00\x11Q\x98": {
+        "modelName": SwitchbotModel.KEYPAD_VISION_PRO,
+        "modelFriendlyName": "Keypad Vision Pro",
+        "func": process_keypad_vision_pro,
+        "manufacturer_id": 2409,
+    },
+    b"\x01\x11Q\x98": {
+        "modelName": SwitchbotModel.KEYPAD_VISION_PRO,
+        "modelFriendlyName": "Keypad Vision Pro",
+        "func": process_keypad_vision_pro,
+        "manufacturer_id": 2409,
+    },
+    b"\x00\x11\x69\x09": {
+        "modelName": SwitchbotModel.LOCK_VISION_PRO,
+        "modelFriendlyName": "Lock Vision Pro",
+        "func": process_lock2,
+        "manufacturer_id": 2409,
+    },
+    b"\x01\x11\x69\x09": {
+        "modelName": SwitchbotModel.LOCK_VISION_PRO,
+        "modelFriendlyName": "Lock Vision Pro",
+        "func": process_lock2,
+        "manufacturer_id": 2409,
+    },
+    b"\x00\x11\x69\x08": {
+        "modelName": SwitchbotModel.LOCK_VISION,
+        "modelFriendlyName": "Lock Vision",
+        "func": process_locklite,
+        "manufacturer_id": 2409,
+    },
+    b"\x01\x11\x69\x08": {
+        "modelName": SwitchbotModel.LOCK_VISION,
+        "modelFriendlyName": "Lock Vision",
+        "func": process_locklite,
+        "manufacturer_id": 2409,
+    },
+    b"\x00\x10\xff\x90": {
+        "modelName": SwitchbotModel.LOCK_PRO_WIFI,
+        "modelFriendlyName": "Lock Pro Wifi",
+        "func": process_wolock_pro,
+        "manufacturer_id": 2409,
+    },
+    b"\x01\x10\xff\x90": {
+        "modelName": SwitchbotModel.LOCK_PRO_WIFI,
+        "modelFriendlyName": "Lock Pro Wifi",
+        "func": process_wolock_pro,
+        "manufacturer_id": 2409,
+    },
+    b"\x00\x11\x9f\xb8": {
+        "modelName": SwitchbotModel.LOCK_ULTRA_MAX,
+        "modelFriendlyName": "Lock Ultra Max",
+        "func": process_lock2,
+        "manufacturer_id": 2409,
+    },
+    b"\x01\x11\x9f\xb8": {
+        "modelName": SwitchbotModel.LOCK_ULTRA_MAX,
+        "modelFriendlyName": "Lock Ultra Max",
+        "func": process_lock2,
+        "manufacturer_id": 2409,
+    },
+    b"\x00\x11\x07\x60": {
+        "modelName": SwitchbotModel.STANDING_FAN,
+        "modelFriendlyName": "Standing Fan",
+        "func": process_standing_fan,
+        "manufacturer_id": 2409,
+    },
+    b"\x01\x11\x07\x60": {
+        "modelName": SwitchbotModel.STANDING_FAN,
+        "modelFriendlyName": "Standing Fan",
+        "func": process_standing_fan,
+        "manufacturer_id": 2409,
+    },
+    b"\x00\x10\x53\xb0": {
+        "modelName": SwitchbotModel.WEATHER_STATION,
+        "modelFriendlyName": "Weather Station",
+        "func": process_weather_station,
+        "manufacturer_id": 2409,
+    },
+    b"\x01\x10\x53\xb0": {
+        "modelName": SwitchbotModel.WEATHER_STATION,
+        "modelFriendlyName": "Weather Station",
+        "func": process_weather_station,
+        "manufacturer_id": 2409,
+    },
+}
+
+_SWITCHBOT_MODEL_TO_CHAR: defaultdict[SwitchbotModel, list[str | bytes]] = defaultdict(
+    list
+)
+for model_chr, model_data in SUPPORTED_TYPES.items():
+    _SWITCHBOT_MODEL_TO_CHAR[model_data["modelName"]].append(model_chr)
+
+MODELS_BY_MANUFACTURER_DATA: dict[int, list[tuple[str, SwitchbotSupportedType]]] = {
+    mfr_id: [] for mfr_id in MFR_DATA_ORDER
+}
+for model_chr, model in SUPPORTED_TYPES.items():
+    if "manufacturer_id" in model:
+        mfr_id = model["manufacturer_id"]
+        MODELS_BY_MANUFACTURER_DATA[mfr_id].append((model_chr, model))
+
+
+def parse_advertisement_data(
+    device: BLEDevice,
+    advertisement_data: AdvertisementData,
+    model: SwitchbotModel | None = None,
+) -> SwitchBotAdvertisement | None:
+    """Parse advertisement data."""
+    upper_mac = format_mac_upper(device.address)
+    if model is None and upper_mac in _MODEL_TO_MAC_CACHE:
+        model = _MODEL_TO_MAC_CACHE[upper_mac]
+
+    service_data = advertisement_data.service_data
+
+    _service_data = None
+    for uuid in SERVICE_DATA_ORDER:
+        if uuid in service_data:
+            _service_data = service_data[uuid]
+            break
+
+    _mfr_data = None
+    _mfr_id = None
+    for mfr_id in MFR_DATA_ORDER:
+        if mfr_id in advertisement_data.manufacturer_data:
+            _mfr_id = mfr_id
+            _mfr_data = advertisement_data.manufacturer_data[mfr_id]
+            break
+
+    if _mfr_data is None and _service_data is None:
+        return None
+
+    try:
+        data = _parse_data(
+            _service_data,
+            _mfr_data,
+            _mfr_id,
+            model,
+        )
+    except Exception:  # pylint: disable=broad-except
+        _LOGGER.exception("Failed to parse advertisement data: %s", advertisement_data)
+        return None
+
+    if not data:
+        return None
+
+    return SwitchBotAdvertisement(
+        device.address, data, device, advertisement_data.rssi, bool(_service_data)
+    )
+
+
+def _find_model_from_service_data(_service_data: bytes) -> str | bytes | None:
+    """Find model from service data."""
+    char_model = chr(_service_data[0] & 0b01111111)
+    if char_model in SUPPORTED_TYPES:
+        return char_model
+
+    byte_model = bytes([_service_data[0] & 0b01111111])
+    if byte_model in SUPPORTED_TYPES:
+        return byte_model
+
+    return None
+
+
+def _find_model_from_switchbot_model(
+    _switchbot_model: SwitchbotModel,
+) -> str | bytes | None:
+    """Find model from switchbot model."""
+    if _switchbot_model in _SWITCHBOT_MODEL_TO_CHAR:
+        return _SWITCHBOT_MODEL_TO_CHAR[_switchbot_model][0]
+    return None
+
+
+def _find_model_from_manufacturer_data(
+    _mfr_id: int, _mfr_data: bytes | None
+) -> str | bytes | None:
+    """Find model from manufacturer data."""
+    if _mfr_id not in MODELS_BY_MANUFACTURER_DATA or _mfr_data is None:
+        return None
+
+    for model_chr, model_data in MODELS_BY_MANUFACTURER_DATA[_mfr_id]:
+        expected_length = model_data.get("manufacturer_data_length")
+        if expected_length is not None and expected_length == len(_mfr_data):
+            return model_chr
+    return None
+
+
+def _find_model_from_service_data_suffix(_service_data: bytes) -> str | bytes | None:
+    """Find model from service data suffix."""
+    if len(_service_data) <= 5:
+        return None
+
+    for s in (_service_data[-4:], _service_data[-5:-1]):
+        if s in SUPPORTED_TYPES:
+            return s
+    return None
+
+
+def build_advertisement_data(
+    _model: str | bytes, _service_data: bytes | None, _mfr_data: bytes | None
+) -> dict[str, Any]:
+    """Build advertisement data dictionary."""
+    _isEncrypted = bool(_service_data[0] & 0b10000000) if _service_data else False
+    data = {
+        "rawAdvData": _service_data,
+        "data": {},
+        "model": _model,
+        "isEncrypted": _isEncrypted,
+    }
+
+    type_data = SUPPORTED_TYPES.get(_model)
+    if type_data:
+        model_data = type_data["func"](_service_data, _mfr_data)
+        if model_data:
+            data.update(
+                {
+                    "modelFriendlyName": type_data["modelFriendlyName"],
+                    "modelName": type_data["modelName"],
+                    "data": model_data,
+                }
+            )
+
+    return data
+
+
+@lru_cache(maxsize=128)
+def _parse_data(
+    _service_data: bytes | None,
+    _mfr_data: bytes | None,
+    _mfr_id: int | None = None,
+    _switchbot_model: SwitchbotModel | None = None,
+) -> dict[str, Any] | None:
+    """Parse advertisement data."""
+    _model = None
+
+    if _service_data:
+        _model = _find_model_from_service_data(_service_data)
+
+    if not _model and _switchbot_model:
+        _model = _find_model_from_switchbot_model(_switchbot_model)
+
+    if not _model and _mfr_id:
+        _model = _find_model_from_manufacturer_data(_mfr_id, _mfr_data)
+
+    if not _model and _service_data:
+        _model = _find_model_from_service_data_suffix(_service_data)
+
+    if not _model:
+        return None
+
+    return build_advertisement_data(_model, _service_data, _mfr_data)
+
+
+def populate_model_to_mac_cache(mac: str, model: SwitchbotModel) -> None:
+    """Populate the model to MAC address cache."""
+    _MODEL_TO_MAC_CACHE[mac] = model

@@ -1,38 +1,38 @@
-# API do servidor Domotica
+# Home automation server API
 
-Base URL usada nos exemplos:
+Base URL used in the examples:
 
 ```text
 https://example.invalid
 ```
 
-Substituir todos os valores entre `<...>` pelos valores reais. Todos os
-endpoints, exceto `GET /health`, exigem:
+Replace all values enclosed in `<...>` with actual values. All endpoints,
+except `GET /health`, require:
 
 ```http
 Authorization: Bearer <TOKEN>
 ```
 
-Os endpoints de operacao recebem as coordenadas nos headers:
+Operation endpoints receive coordinates in the headers:
 
 ```http
 X-Latitude: <LATITUDE>
 X-Longitude: <LONGITUDE>
 ```
 
-Os dias permitidos usam `monday`, `tuesday`, `wednesday`, `thursday`,
-`friday`, `saturday` e `sunday`. As horas usam `HH:MM` e sao avaliadas no
-timezone `Europe/Lisbon`.
+Allowed days use `monday`, `tuesday`, `wednesday`, `thursday`,
+`friday`, `saturday`, and `sunday`. Times use `HH:MM` and are evaluated in the
+`Europe/Lisbon` time zone.
 
-## Estado do servidor
+## Server status
 
 ### `GET /health`
 
-Verifica se o servidor HTTP esta ativo. Nao requer autenticacao.
+Checks whether the HTTP server is running. No authentication required.
 
-Payload: sem body.
+Payload: no body.
 
-Resposta `200 OK`:
+Response `200 OK`:
 
 ```json
 {
@@ -40,41 +40,42 @@ Resposta `200 OK`:
 }
 ```
 
-## Permissoes do utilizador
+## User permissions
 
 ### `GET /access/capabilities?lat=<LATITUDE>&lon=<LONGITUDE>`
 
-Identifica o utilizador pelo bearer e calcula se pode operar cada porta,
-considerando estado, role, horario, dia, distancia e acesso remoto.
+Identifies the user by their bearer token and determines whether they can
+operate each door, taking into account their status, role, schedule, day,
+distance, and remote access permissions.
 
-Payload: sem body. As coordenadas sao enviadas na query string.
+Payload: no body. Coordinates are sent in the query string.
 
-Resposta `200 OK`:
+Response `200 OK`:
 
 ```json
 {
   "user": {
     "id": <USER_ID>,
-    "name": "<NOME>",
+    "name": "<NAME>",
     "role": "<admin|user>"
   },
   "location": {
     "lat": <LATITUDE>,
     "lon": <LONGITUDE>,
-    "distance_m": <DISTANCIA_METROS>,
+    "distance_m": <DISTANCE_METERS>,
     "remote": <true|false>
   },
   "local_distance_limit_m": 100.0,
   "doors": {
     "APT": {
-      "distance_m": <DISTANCIA_METROS>,
+      "distance_m": <DISTANCE_METERS>,
       "can_open": <true|false>,
       "mode": "<local|remote>",
       "requires_warning": <true|false>,
       "reason": <null|"user_disabled"|"outside_allowed_schedule"|"remote_access_not_allowed">
     },
     "BLD": {
-      "distance_m": <DISTANCIA_METROS>,
+      "distance_m": <DISTANCE_METERS>,
       "can_open": <true|false>,
       "mode": "<local|remote>",
       "requires_warning": <true|false>,
@@ -84,7 +85,7 @@ Resposta `200 OK`:
 }
 ```
 
-Resposta `400 Bad Request`, coordenadas ausentes ou invalidas:
+Response `400 Bad Request`, missing or invalid coordinates:
 
 ```json
 {
@@ -93,108 +94,108 @@ Resposta `400 Bad Request`, coordenadas ausentes ou invalidas:
 }
 ```
 
-## Porta do apartamento
+## Apartment door
 
-Os endpoints seguintes repetem todas as validacoes no backend antes de chamar
-o dispositivo. Utilizadores `admin` ativos podem operar sem os headers de GPS.
+The following endpoints repeat all backend checks before calling the device.
+Enabled `admin` users can operate without GPS headers.
 
 ### `GET /apt_door/status`
 
-Consulta o estado da fechadura do apartamento.
+Retrieves the status of the apartment door lock.
 
-Payload: sem body.
+Payload: no body.
 
-Resposta `200 OK`:
+Response `200 OK`:
 
 ```json
 {
   "ok": true,
-  "output": "<ESTADO_DEVOLVIDO_PELO_SWITCHBOT>"
+  "output": "<STATUS_RETURNED_BY_SWITCHBOT>"
 }
 ```
 
 ### `POST /apt_door/open`
 
-Destranca e abre a porta do apartamento.
+Unlocks and opens the apartment door.
 
-Payload: sem body; enviar bearer e coordenadas nos headers.
+Payload: no body; send the bearer token and coordinates in the headers.
 
-Resposta `200 OK`:
+Response `200 OK`:
 
 ```json
 {
   "ok": true,
-  "output": "<RESULTADO_DO_SWITCHBOT>"
+  "output": "<SWITCHBOT_RESULT>"
 }
 ```
 
 ### `POST /apt_door/unlock`
 
-Destranca a porta do apartamento sem abrir.
+Unlocks the apartment door without opening it.
 
-Payload: sem body; enviar bearer e coordenadas nos headers.
+Payload: no body; send the bearer token and coordinates in the headers.
 
-Resposta `200 OK`:
+Response `200 OK`:
 
 ```json
 {
   "ok": true,
-  "output": "<RESULTADO_DO_SWITCHBOT>"
+  "output": "<SWITCHBOT_RESULT>"
 }
 ```
 
 ### `POST /apt_door/lock`
 
-Tranca a porta do apartamento.
+Locks the apartment door.
 
-Payload: sem body; enviar bearer e coordenadas nos headers.
+Payload: no body; send the bearer token and coordinates in the headers.
 
-Resposta `200 OK`:
+Response `200 OK`:
 
 ```json
 {
   "ok": true,
-  "output": "<RESULTADO_DO_SWITCHBOT>"
+  "output": "<SWITCHBOT_RESULT>"
 }
 ```
 
-## Porta do predio
+## Building door
 
 ### `POST /bld_door`
 
-Pressiona o SwitchBot que abre a porta do predio.
+Triggers the SwitchBot Bot to press the button that opens the building door.
 
-Payload: sem body; enviar bearer e coordenadas nos headers.
+Payload: no body; send the bearer token and coordinates in the headers.
 
-Resposta `200 OK`:
+Response `200 OK`:
 
 ```json
 {
   "ok": true,
-  "output": "<RESULTADO_DO_SWITCHBOT>"
+  "output": "<SWITCHBOT_RESULT>"
 }
 ```
 
-## Administracao de utilizadores
+## User administration
 
-Todos os endpoints desta seccao exigem o bearer de um utilizador `admin`
-ativo. As respostas nunca incluem o token nem o seu hash, exceto o token
-completo devolvido uma unica vez pelo `POST /admin/users`.
-O admin autentica-se apenas com o seu proprio bearer; nao precisa dos tokens
-dos restantes utilizadores.
+All endpoints in this section require the bearer token of an enabled `admin`
+user. Responses never include the token or its hash, except for the full token
+returned once by `POST /admin/users`.
+The administrator authenticates using only their own bearer token; they do not
+need other users' tokens.
 
-Representacao normal de um utilizador:
+Standard user representation:
 
 ```json
 {
   "id": <USER_ID>,
-  "name": "<NOME>",
+  "name": "<NAME>",
   "role": "<admin|user>",
   "enabled": <true|false>,
   "allow_remote": <true|false>,
   "schedules": [
     {
-      "allowed_days": ["<DIA_1>", "<DIA_2>"],
+      "allowed_days": ["<DAY_1>", "<DAY_2>"],
       "start_time": "<HH:MM>",
       "end_time": "<HH:MM>"
     }
@@ -202,24 +203,24 @@ Representacao normal de um utilizador:
 }
 ```
 
-`allow_remote: false` permite apenas operacoes locais, a menos de 100 metros.
-`allow_remote: true` permite operacoes a qualquer distancia. O limite local de
-100 metros e fixo no backend.
+`allow_remote: false` permits only local operations, within 100 meters.
+`allow_remote: true` permits operations at any distance. The 100-meter local
+limit is fixed in the backend.
 
-Cada item de `schedules` e um periodo independente. O utilizador pode operar
-quando pelo menos um periodo corresponde ao dia e hora atuais. Uma lista vazia
-nao permite operar em nenhum horario. Para compatibilidade, os campos antigos
-`allowed_days`, `start_time` e `end_time` ainda podem ser enviados sem
-`schedules`; o servidor converte-os num unico periodo.
+Each item in `schedules` is an independent time period. The user can operate
+when at least one period matches the current day and time. An empty list
+does not allow operations at any time. For compatibility, the legacy fields
+`allowed_days`, `start_time`, and `end_time` can still be sent without
+`schedules`; the server converts them into a single period.
 
 ### `GET /admin/access-history?limit=<1..200>`
 
-Lista as aberturas de porta mais recentes, da mais recente para a mais antiga.
-O `limit` e opcional e tem o valor predefinido `50`. Apenas acoes concluidas
-com sucesso em `POST /apt_door/open`, `POST /apt_door/lock`,
-`POST /apt_door/unlock` e `POST /bld_door` sao registadas.
+Lists the most recent door operations, from newest to oldest.
+The `limit` parameter is optional and defaults to `50`. Only successful actions
+on `POST /apt_door/open`, `POST /apt_door/lock`,
+`POST /apt_door/unlock`, and `POST /bld_door` are recorded.
 
-Resposta `200 OK`:
+Response `200 OK`:
 
 ```json
 {
@@ -236,29 +237,29 @@ Resposta `200 OK`:
 }
 ```
 
-O historico e guardado atomicamente em `access-history.json`, com permissao
-`0600` e retencao das 5000 entradas mais recentes.
+The history is saved atomically to `access-history.json` with `0600`
+permissions, retaining the 5,000 most recent entries.
 
 ### `GET /admin/users`
 
-Lista todos os utilizadores.
+Lists all users.
 
-Payload: sem body.
+Payload: no body.
 
-Resposta `200 OK`:
+Response `200 OK`:
 
 ```json
 {
   "users": [
     {
       "id": <USER_ID>,
-      "name": "<NOME>",
+      "name": "<NAME>",
       "role": "<admin|user>",
       "enabled": <true|false>,
       "allow_remote": <true|false>,
       "schedules": [
         {
-          "allowed_days": ["<DIA_1>", "<DIA_2>"],
+          "allowed_days": ["<DAY_1>", "<DAY_2>"],
           "start_time": "<HH:MM>",
           "end_time": "<HH:MM>"
         }
@@ -270,14 +271,14 @@ Resposta `200 OK`:
 
 ### `POST /admin/users`
 
-Cria um utilizador com `role=user` e gera um token seguro. `name` e
-obrigatorio; os restantes campos sao opcionais.
+Creates a user with `role=user` and generates a secure token. `name` is
+required; the remaining fields are optional.
 
 Payload:
 
 ```json
 {
-  "name": "<NOME>",
+  "name": "<NAME>",
   "enabled": <true|false>,
   "allow_remote": <true|false>,
   "schedules": [
@@ -295,41 +296,41 @@ Payload:
 }
 ```
 
-Resposta `201 Created`:
+Response `201 Created`:
 
 ```json
 {
   "id": <USER_ID>,
-  "name": "<NOME>",
+  "name": "<NAME>",
   "role": "user",
   "enabled": <true|false>,
   "allow_remote": <true|false>,
   "schedules": [
     {
-      "allowed_days": ["<DIA_1>", "<DIA_2>"],
+      "allowed_days": ["<DAY_1>", "<DAY_2>"],
       "start_time": "<HH:MM>",
       "end_time": "<HH:MM>"
     }
   ],
-  "token": "<TOKEN_COMPLETO_GUARDAR_AGORA>"
+  "token": "<FULL_TOKEN_SAVE_NOW>"
 }
 ```
 
 ### `GET /admin/users/{id}`
 
-Consulta um utilizador pelo ID.
+Retrieves a user by ID.
 
-Exemplo de endpoint:
+Example endpoint:
 
 ```text
 GET /admin/users/<USER_ID>
 ```
 
-Payload: sem body.
+Payload: no body.
 
-Resposta `200 OK`: representacao normal do utilizador, sem token.
+Response `200 OK`: standard user representation, without a token.
 
-Resposta `404 Not Found`:
+Response `404 Not Found`:
 
 ```json
 {
@@ -340,14 +341,14 @@ Resposta `404 Not Found`:
 
 ### `PUT /admin/users/{id}`
 
-Altera um ou mais campos editaveis do utilizador. Nao e necessario enviar os
-campos que ficam iguais. `id`, `role` e token nao podem ser alterados.
+Updates one or more editable user fields. Fields that remain unchanged do not
+need to be sent. `id`, `role`, and the token cannot be changed.
 
-Payload de exemplo:
+Example payload:
 
 ```json
 {
-  "name": "<NOVO_NOME>",
+  "name": "<NEW_NAME>",
   "enabled": <true|false>,
   "allow_remote": <true|false>,
   "schedules": [
@@ -365,27 +366,27 @@ Payload de exemplo:
 }
 ```
 
-Resposta `200 OK`: representacao atualizada do utilizador, sem token.
+Response `200 OK`: updated user representation, without a token.
 
 ### `DELETE /admin/users/{id}`
 
-Apaga permanentemente um utilizador.
+Permanently deletes a user.
 
-Payload: sem body.
+Payload: no body.
 
-Resposta `204 No Content`: sem body.
+Response `204 No Content`: no body.
 
-## Respostas de erro comuns
+## Common error responses
 
-Bearer ausente ou invalido:
+Missing or invalid bearer token:
 
 ```text
 HTTP 401 Unauthorized
 WWW-Authenticate: Bearer
-<sem body>
+<no body>
 ```
 
-Utilizador normal a tentar aceder a `/admin/*`:
+A regular user attempting to access `/admin/*`:
 
 ```json
 {
@@ -394,21 +395,22 @@ Utilizador normal a tentar aceder a `/admin/*`:
 }
 ```
 
-Operacao recusada pelas permissoes:
+Operation denied by permissions:
 
 ```json
 {
   "ok": false,
-  "error": "<RAZAO>",
-  "reason": "<RAZAO>",
-  "distance_m": <DISTANCIA_METROS>
+  "error": "<REASON>",
+  "reason": "<REASON>",
+  "distance_m": <DISTANCE_METERS>
 }
 ```
 
-`<RAZAO>` pode ser `user_disabled`, `outside_allowed_schedule` ou
+`<REASON>` can be `user_disabled`, `outside_allowed_schedule`, or
 `remote_access_not_allowed`.
 
-Coordenadas obrigatorias ausentes ou invalidas numa operacao de utilizador:
+Missing or invalid required coordinates for a user operation (the API returns
+this message in Portuguese, meaning "GPS coordinates required or invalid"):
 
 ```json
 {
@@ -417,20 +419,20 @@ Coordenadas obrigatorias ausentes ou invalidas numa operacao de utilizador:
 }
 ```
 
-Payload administrativo invalido:
+Invalid administrative payload:
 
 ```json
 {
   "ok": false,
-  "error": "<DESCRICAO_DO_CAMPO_INVALIDO>"
+  "error": "<INVALID_FIELD_DESCRIPTION>"
 }
 ```
 
-Falha ao executar o dispositivo:
+Device operation failed:
 
 ```json
 {
   "ok": false,
-  "error": "<DESCRICAO_DA_FALHA>"
+  "error": "<FAILURE_DESCRIPTION>"
 }
 ```
