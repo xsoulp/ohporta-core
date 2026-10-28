@@ -2,8 +2,7 @@
 
 A local HTTP API for controlling devices via Bluetooth, particularly SwitchBot
 devices. It currently supports a SwitchBot Lock Pro smart lock and a SwitchBot
-Bot. This branch is independent of the Android application maintained on the
-`main` branch.
+Bot. This is independent of the Android application maintained at https://github.com/xsoulp/ohporta-android
 
 ## Installation
 
