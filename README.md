@@ -91,6 +91,8 @@ python ohporta-server.py
 Every start reads `.server.env` and the existing accounts from `users.json`.
 No token file is needed again. Keep `users.json` to preserve users and tokens.
 The device scripts read their respective `.env` files whenever they run.
+The persistent Bluetooth backend also rereads the device configuration before
+each operation and replaces cached devices when their configuration changes.
 
 For migration only, `--restricted-token-file` can optionally import an existing
 regular-user token alongside the admin token during first-time setup.
@@ -130,6 +132,61 @@ POST /bld_door
 ```
 
 See [readme_api.md](readme_api.md) for the complete API documentation.
+
+## Raspberry Pi performance
+
+The server defaults to `--bluetooth-mode persistent`. A dedicated Bluetooth
+event loop imports the device library once, reuses discovered devices, and
+reuses GATT connections between nearby requests. The library still disconnects
+after about 8.5 seconds of inactivity; no continuous scan or battery-draining
+keepalive is used. The configured MAC is first looked up in BlueZ's known
+devices, allowing commands to connect without a discovery scan even on the
+first request after service startup. Discovery is a fallback only when BlueZ
+has no matching device, for example after it forgets an unpaired device on an
+adapter restart. Later operations reuse the same device object.
+
+Lock status requests wait for the first valid, fresh advertisement instead of
+waiting for a full five-second scan. They never serve cached door status and
+may need to release an existing lock connection before scanning. Physical
+operations still require device acknowledgement, and the Bot retains its
+warm-up for new or reopened connections. Existing library retries remain in
+place; the backend does not replay failed operations or automatically switch
+modes after an error.
+
+HTTP requests run concurrently, so health, permissions, and administration
+remain responsive during Bluetooth operations. Only one Bluetooth operation
+runs at a time. An overlapping device request receives `409 device_busy`
+instead of being queued. A command timeout can require up to three additional
+seconds to clean up the connection before returning `504`.
+
+After updating the checkout on the Pi, restart the service:
+
+```sh
+systemctl --user restart switchbot-http.service
+journalctl --user -u switchbot-http.service -f
+```
+
+Each device request logs its elapsed time as `device command /... completed in
+...s`, including discovery, command execution, and history persistence. Compare
+the same operation on the Pi, both after startup and on repeated requests.
+The actual improvement depends on radio conditions, BlueZ, and the device;
+hardware latency must be measured on the Pi.
+
+To compare with the original subprocess backend, stop the service and run:
+
+```sh
+systemctl --user stop switchbot-http.service
+python ohporta-server.py --bluetooth-mode subprocess
+```
+
+Stop the comparison process with Ctrl+C and restart the service to restore the
+persistent backend. The standalone device scripts remain available.
+
+Hardware-independent regression checks:
+
+```sh
+python -m unittest discover -s tests -v
+```
 
 ## Bundled SwitchBot code
 

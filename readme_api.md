@@ -378,6 +378,26 @@ Response `204 No Content`: no body.
 
 ## Common error responses
 
+Another Bluetooth operation is already running (`409 Conflict`):
+
+```json
+{
+  "ok": false,
+  "error": "device_busy"
+}
+```
+
+This applies to all device endpoints, including `GET /apt_door/status`. The
+request is rejected before invoking the device and is not queued. Health,
+capabilities, and administration requests remain available. Avoid overlapping
+device requests; pause status polling while sending a door command.
+
+An operation exceeding the configured timeout returns `504 Gateway Timeout`
+with `{"ok":false,"error":"command timed out"}`. Connection cleanup can add up
+to three seconds. An error or timeout after a physical command was transmitted
+does not prove that the door did not move; check its state before deciding
+whether to issue another command.
+
 Missing or invalid bearer token:
 
 ```text

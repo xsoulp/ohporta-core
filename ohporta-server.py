@@ -11,8 +11,9 @@ import re
 import secrets
 import subprocess
 import threading
+import time
 from datetime import datetime, timedelta
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 from zoneinfo import ZoneInfo
@@ -387,10 +388,22 @@ def access_decision(user, is_remote, now=None):
     return True, None
 
 
-class SwitchBotHTTPServer(HTTPServer):
+class SwitchBotHTTPServer(ThreadingHTTPServer):
+    # Wait for request handlers before shutting down the shared BLE worker.
+    daemon_threads = False
     command_timeout: float
     user_store: UserStore
     history_store: AccessHistoryStore
+
+    def __init__(self, *args, **kwargs):
+        self.command_lock = threading.Lock()
+        self.bluetooth_worker = None
+        super().__init__(*args, **kwargs)
+
+    def get_request(self):
+        connection, address = super().get_request()
+        connection.settimeout(10)
+        return connection, address
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -555,16 +568,45 @@ class Handler(BaseHTTPRequestHandler):
             self._method_not_allowed(("GET", "PUT", "DELETE"))
 
     def _execute_command(self, path, argv, user):
+        # Reject overlap instead of queuing physical actions that might run
+        # after a client has timed out and retried. Reads remain responsive.
+        if not self.server.command_lock.acquire(blocking=False):
+            self._reply(409, {"ok": False, "error": "device_busy"})
+            return
+        started = time.monotonic()
         try:
-            result = subprocess.run(argv, cwd=BASE_DIR, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=self.server.command_timeout, check=False)
-        except subprocess.TimeoutExpired:
+            self._run_command(path, argv, user)
+        finally:
+            self.log_message("device command %s completed in %.3fs", path, time.monotonic() - started)
+            self.server.command_lock.release()
+
+    def _run_command(self, path, argv, user):
+        try:
+            if self.server.bluetooth_worker is not None:
+                from bluetooth_runtime import DeviceError
+
+                try:
+                    output = self.server.bluetooth_worker.execute(path, self.server.command_timeout)
+                except DeviceError as exc:
+                    self._reply(exc.status, {"ok": False, "error": str(exc)})
+                    return
+                except TimeoutError:
+                    raise
+                except Exception:
+                    self._reply(502, {"ok": False, "error": "Bluetooth command failed"})
+                    return
+                error, returncode = "", 0
+            else:
+                result = subprocess.run(argv, cwd=BASE_DIR, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=self.server.command_timeout, check=False)
+                output, error = result.stdout.strip(), result.stderr.strip()
+                returncode = result.returncode
+        except (subprocess.TimeoutExpired, TimeoutError):
             self._reply(504, {"ok": False, "error": "command timed out"})
             return
         except OSError as exc:
             self._reply(500, {"ok": False, "error": str(exc)})
             return
-        output, error = result.stdout.strip(), result.stderr.strip()
-        if result.returncode == 0:
+        if returncode == 0:
             if path in ("/apt_door/open", "/apt_door/lock", "/apt_door/unlock", "/bld_door"):
                 door = "APT" if path.startswith("/apt_door/") else "BLD"
                 action = path.rsplit("/", 1)[-1] if door == "APT" else "open"
@@ -646,6 +688,7 @@ def parse_args():
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--timeout", type=float, default=45.0)
+    parser.add_argument("--bluetooth-mode", choices=("persistent", "subprocess"), default="persistent", help="reuse the BLE event loop and connections (default), or run the original CLI scripts")
     parser.add_argument("--users-file", type=Path, default=BASE_DIR / "users.json")
     parser.add_argument("--history-file", type=Path, default=BASE_DIR / "access-history.json")
     parser.add_argument("--token-file", type=Path, help="admin token file, required for first-time setup")
@@ -680,6 +723,10 @@ def main():
     server.user_store = user_store
     server.history_store = AccessHistoryStore(args.history_file.expanduser())
     server.command_timeout = args.timeout
+    if args.bluetooth_mode == "persistent":
+        from bluetooth_runtime import BluetoothWorker
+
+        server.bluetooth_worker = BluetoothWorker(BASE_DIR)
     print(f"Listening on {args.host}:{args.port}", flush=True)
     try:
         server.serve_forever()
@@ -687,6 +734,8 @@ def main():
         pass
     finally:
         server.server_close()
+        if server.bluetooth_worker is not None:
+            server.bluetooth_worker.close()
 
 
 if __name__ == "__main__":
